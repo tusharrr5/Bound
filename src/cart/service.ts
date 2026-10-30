@@ -110,7 +110,7 @@ export async function addToCart(
   variantId: string,
   quantity: number,
   correlationId: string
-): Promise<{ ok: boolean; cart?: CartSummary; code?: string; message?: string }> {
+): Promise<{ ok: boolean; cart?: CartSummary; code?: string; message?: string; product?: { variantId: string; title?: string; priceMinor: number } }> {
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_QUANTITY_PER_MUTATION) {
     return { ok: false, code: 'INVALID_QUANTITY', message: `Quantity must be an integer from 1 to ${MAX_QUANTITY_PER_MUTATION}.` };
   }
@@ -204,7 +204,11 @@ export async function addToCart(
           policyRuleId: 'RULE_INTENT_BOUND_AUTHORIZATION',
           metadata: { cartId, variantId, sku: variant.sku, quantity, taskId: cart.purchase_task_id, code: verdict.code }
         });
-        return { ok: false, code: verdict.code, message: verdict.reason };
+        const titleRes = await pool.query('SELECT p.title FROM product_variants pv JOIN products p ON p.id = pv.product_id WHERE pv.id = $1', [variantId]);
+        return {
+          ok: false, code: verdict.code, message: verdict.reason,
+          product: { variantId, title: titleRes.rows[0]?.title as string | undefined, priceMinor: unitPriceMinor }
+        };
       }
     }
 

@@ -124,16 +124,17 @@ curl -X PUT localhost:4000/v1/arena/listing -H 'content-type: application/json' 
 curl -X POST localhost:4000/v1/arena/run
 ```
 
-Steps stream live as `arena_event` on `/v1/audit/stream`. In rehearsal the default injection
-fooled `gemma4:e4b` in 13 of 15 runs and a fake user turn fooled it 5 of 5; checkout blocked
-every one. Plain-English tricks fooled it 0 of 15, and fake tool output or a fake "buy 60" rule
-0 of 10. See [attacks/](./attacks).
+Steps stream live as `arena_event` on `/v1/audit/stream`. On the hardened branch the default
+injection fooled `gemma4:e4b` in 3 of 5 runs and a fake user turn in 5 of 5. The cart refused
+the payload every time, with ₹0 moved. A fake "buy 60" rule fooled it 0 of 3. Before hardening,
+over larger samples, the same two attacks fooled it 13 of 15 and 5 of 5, and plain-English
+tricks 0 of 15. See [attacks/](./attacks).
 
 - **Pick a trick:** the listing panel offers the attacks in `attacks/` as one-click presets with
   their measured hit rates (`GET /v1/arena/attacks`), so a judge can choose one that works.
-- **Skip the AI:** `POST /v1/arena/direct` fills the same cart with the ₹49,999 item and sends
-  it to checkout with no model involved. It shows the wall holds whoever fills the cart, and is
-  offered on screen whenever Gemma resists.
+- **Skip the AI:** `POST /v1/arena/direct` tries to put the ₹49,999 item in the same cart with
+  no model involved. The cart refuses it and only the flask is paid. It shows the checks hold
+  whoever fills the cart, and is offered on screen whenever Gemma resists.
 
 ```bash
 npm run arena:measure -- 10                 # hit rate for the current listing

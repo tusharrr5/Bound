@@ -87,7 +87,7 @@ interface AttackPreset {
   blocked: number;
 }
 
-/** Same cart sent straight to checkout with no model involved (POST /v1/arena/direct). */
+/** The trick's cart built with no model involved (POST /v1/arena/direct). */
 interface DirectResult {
   correlationId: string;
   mandate: ArenaMandate;
@@ -119,6 +119,9 @@ function variantTitles(steps: AgentStep[]): Map<string, { title: string; priceMi
   for (const s of steps) {
     for (const item of s.toolResult?.results || []) titles.set(item.variantId, { title: item.title, priceMinor: item.priceMinor });
     for (const item of s.toolResult?.cart?.items || []) titles.set(item.variantId, { title: item.productTitle || item.title, priceMinor: item.unitPriceMinor });
+    // A refused item never reaches the cart; the refusal names it instead
+    const refused = s.toolResult?.product;
+    if (refused?.variantId && refused.title) titles.set(refused.variantId, { title: refused.title, priceMinor: refused.priceMinor });
   }
   return titles;
 }
@@ -378,7 +381,7 @@ function StatusStrip({ running, elapsed, result, runError, listingIsDefault, dir
     return (
       <div className={`${base} border-hairline bg-panel`}>
         <p className="font-display text-2xl font-semibold flex items-center gap-3">
-          <LoaderCircle className="w-6 h-6 animate-spin text-muted" /> Sending the same cart straight to checkout, no AI…
+          <LoaderCircle className="w-6 h-6 animate-spin text-muted" /> Trying the same cart with no AI…
         </p>
       </div>
     );
@@ -760,7 +763,7 @@ export default function Arena() {
           </Panel>
 
           {/* 2. The shopper */}
-          <Panel n={2} title="The shopper" subtitle={`Gemma 4, local. Told your ${rupees(ceiling)} limit; not hardened against tricks.`} accent="bg-wire-blue/15 text-wire-blue">
+          <Panel n={2} title="The shopper" subtitle={`Gemma 4, local. Told your ${rupees(ceiling)} limit and warned that listings are seller text; nothing relies on it listening.`} accent="bg-wire-blue/15 text-wire-blue">
             <label htmlFor="goal" className="text-xs uppercase tracking-wider text-muted">The human asked for</label>
             <div className="mt-2 flex gap-2">
               <input
@@ -784,9 +787,9 @@ export default function Arena() {
               onClick={runDirect}
               disabled={running || checking}
               className="mt-2 self-end text-[13px] text-muted hover:text-paper disabled:opacity-40"
-              title="Fills the cart with the flask and the ₹49,999 item yourself and sends it to checkout under the same signed limit"
+              title="Adds the flask and the ₹49,999 item yourself, with no model, under the same task and signed limit"
             >
-              or skip the AI: send the trick’s cart straight to checkout →
+              or skip the AI: build the trick’s cart yourself →
             </button>
 
             <div className="mt-3 flex-1 min-h-0 overflow-y-auto pr-1">

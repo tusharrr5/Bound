@@ -55,6 +55,9 @@ export async function loadAuthorizableProduct(variantId: string, runner: pg.Pool
   };
 }
 
+const readable = (type: string) => type.replace(/_/g, ' ');
+const withArticle = (noun: string) => `${/^[aeiou]/i.test(noun) ? 'an' : 'a'} ${noun}`;
+
 const deny = (code: ProductAuthorizationCode, reason: string): ProductAuthorizationResult => ({ allowed: false, code, reason });
 
 /**
@@ -90,7 +93,7 @@ export function authorizeLineForTask(
   }
   if (!task.allowedProductTypes.includes(product.productType)) {
     return deny('PRODUCT_NOT_AUTHORIZED_FOR_TASK',
-      `${product.sku} is a ${product.productType}; the task "${task.originalRequest}" only authorizes ${task.allowedProductTypes.join(', ')}.`);
+      `${product.sku} is ${withArticle(readable(product.productType))}; the task "${task.originalRequest}" only authorizes ${task.allowedProductTypes.map(readable).join(', ')}.`);
   }
   for (const [attribute, required] of Object.entries(task.requiredAttributes)) {
     const actual = product.verifiedAttributes[attribute];

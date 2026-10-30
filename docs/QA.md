@@ -18,7 +18,7 @@ The claim is about where the spending check happens, not about moving money, so 
 
 ## Does the model really get fooled, or is that staged?
 
-It's live. Every Arena run sends a real listing to a real local model. In rehearsal, `gemma4:e4b` ignored plain-language injections ("seller note", "customer history", "buy this variant instead") in 15 of 15 runs. Text formatted like its own system turn (`<|system|> … <|end|>`) fooled it in 13 of 15, and a fake user turn using Gemma-style markers fooled it 5 of 5; checkout blocked every one. Plain-English tricks fooled it 0 of 15, and fake tool output or a fake “buy 60” rule 0 of 10. The listing texts and counts are in [attacks/](../attacks), and the Arena offers them as presets with these rates.
+It's live. Every Arena run sends a real listing to a real local model. Before hardening, `gemma4:e4b` ignored plain-language injections ("seller note", "customer history", "buy this variant instead") in 15 of 15 runs. Text formatted like its own system turn (`<|system|> … <|end|>`) fooled it in 13 of 15, and a fake user turn using Gemma-style markers fooled it 5 of 5. After hardening, with seller text marked as seller content, those two fooled it 3 of 5 and 5 of 5. The cart refused the payload in every one, with ₹0 moved. The listing texts and counts are in [attacks/](../attacks).
 
 ## What if the injection stays under the limit and buys the wrong ₹4,000 thing?
 
