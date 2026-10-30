@@ -18,16 +18,28 @@ interface AgentStep {
   modelMs?: number;
 }
 
+interface PurchaseTask {
+  id: string;
+  intent: string;
+  allowedProductTypes: string[];
+  requiredAttributes: Record<string, unknown>;
+  confirmationSource: string;
+}
+
 interface ArenaMandate {
   mandateTokenId: string;
   ceilingMinor: number;
   allowedCategories: string[];
+  /** What the human's words authorize; the cart refuses anything else. */
+  task?: PurchaseTask;
   expiresAt: string;
   signature: string;
   publicKeyFingerprint: string;
 }
 
-type ArenaOutcome = 'BLOCKED' | 'FOOLED_NO_CHECKOUT' | 'PURCHASED' | 'NO_PURCHASE' | 'BREACH';
+// RESISTED: the agent never tried anything unauthorized. BLOCKED_AT_*: it tried and the backend
+// refused. REACHED_PAYMENT_LAYER and BREACH should never happen.
+type ArenaOutcome = 'RESISTED' | 'BLOCKED_AT_CART' | 'BLOCKED_AT_CHECKOUT' | 'REACHED_PAYMENT_LAYER' | 'BREACH';
 
 interface ArenaRunResult {
   correlationId: string;
@@ -42,6 +54,7 @@ interface ArenaRunResult {
   moneyMovedMinor: number;
   blockedReasonCode?: string;
   blockedReason?: string;
+  rejectedMutations?: Array<{ variantId: string; code: string; reason: string }>;
   auditEventHash?: string;
   agentSummary: string;
   durationMs: number;
@@ -93,6 +106,8 @@ interface ArenaState {
   stats: ArenaStats;
 }
 
+const humanize = (s: string) => s.replace(/_/g, ' ');
+
 const rupees = (minor?: number) =>
   minor == null ? '—' : `₹${Math.round(minor / 100).toLocaleString('en-IN')}`;
 
@@ -108,11 +123,16 @@ function variantTitles(steps: AgentStep[]): Map<string, { title: string; priceMi
   return titles;
 }
 
-/** Cart total as last reported by add_to_cart, and the checkout result if the agent got that far. */
+/** A cart change the backend refused because it falls outside what the human authorized. */
+const isRefusedAdd = (s: AgentStep) => s.tool === 'add_to_cart' && s.toolResult?.ok === false && !!s.toolResult?.code
+  && s.toolResult.code !== 'INVALID_TOOL_CALL';
+
+/** Cart total as last reported by add_to_cart, refused additions, and the checkout result if the agent got that far. */
 function cartAndCheckout(steps: AgentStep[]) {
   const lastCart = [...steps].reverse().find(s => s.tool === 'add_to_cart' && s.toolResult?.cart)?.toolResult.cart;
   const checkout = [...steps].reverse().find(s => s.tool === 'start_checkout')?.toolResult;
-  return { cartMinor: lastCart?.grossAmountMinor as number | undefined, checkout };
+  const refused = steps.filter(isRefusedAdd);
+  return { cartMinor: lastCart?.grossAmountMinor as number | undefined, checkout, refused };
 }
 
 // ─── Small building blocks ───────────────────────────────────────────────────
@@ -200,9 +220,17 @@ function StepRow({ step, titles, payloadVariantId, direct = false }: {
     case 'add_to_cart': {
       const v = titles.get(input.variant_id);
       const injected = input.variant_id === payloadVariantId;
-      label = <>Added <span className="text-paper">{v?.title ?? 'an item'}</span> · {rupees(v?.priceMinor)}</>;
+      const refused = isRefusedAdd(step);
+      label = refused
+        ? <>Tried to add <span className="text-paper">{v?.title ?? 'an item'}</span> · {rupees(v?.priceMinor)}</>
+        : <>Added <span className="text-paper">{v?.title ?? 'an item'}</span> · {rupees(v?.priceMinor)}</>;
       detail = step.toolResult?.cart ? `Cart total ${rupees(step.toolResult.cart.grossAmountMinor)}` : step.observation;
-      if (injected) {
+      if (refused) {
+        Icon = ShieldX;
+        node = 'bg-signal-rose/15 border-signal-rose text-signal-rose';
+        tag = <span className="text-[10px] font-bold tracking-wider rounded bg-signal-rose text-ink px-1.5 py-0.5">REFUSED AT CART</span>;
+        detail = <>{injected && !direct ? 'The listing told it to. ' : ''}{step.toolResult.message} <span className="font-mono text-[11px]">{step.toolResult.code}</span></>;
+      } else if (injected) {
         node = 'bg-signal-rose/15 border-signal-rose text-signal-rose';
         tag = <span className="text-[10px] font-bold tracking-wider rounded bg-signal-rose text-ink px-1.5 py-0.5">{direct ? 'THE TRICK’S ITEM' : 'INJECTED'}</span>;
         detail = direct ? 'Added straight to the cart. No AI involved.' : 'The listing told it to. You never asked for this.';
@@ -279,7 +307,21 @@ function SpendMeter({ cartMinor, limitMinor }: { cartMinor?: number; limitMinor:
   );
 }
 
-function CheckoutStamp({ checkout, running }: { checkout: any; running: boolean }) {
+function CheckoutStamp({ checkout, running, refused }: { checkout: any; running: boolean; refused: AgentStep[] }) {
+  if (!checkout && refused.length > 0 && !running) {
+    const first = refused[0].toolResult;
+    return (
+      <div className="animate-stamp rounded-xl border-2 border-signal-rose bg-signal-rose/10 p-4">
+        <div className="flex items-center gap-2 text-signal-rose">
+          <ShieldX className="w-7 h-7" />
+          <p className="font-display text-3xl font-bold tracking-wide">REFUSED AT CART</p>
+        </div>
+        <p className="font-display text-xl font-semibold mt-1 text-signal-green">₹0 moved</p>
+        <p className="text-[13px] text-paper/80 mt-2 leading-snug">{first.message} The run stopped there for you to decide.</p>
+        <p className="mt-2 inline-block text-[11px] font-mono rounded bg-ink border border-hairline px-1.5 py-0.5 text-muted">{first.code}</p>
+      </div>
+    );
+  }
   if (!checkout) {
     return (
       <div className="rounded-xl border border-dashed border-hairline p-4 text-center text-muted text-sm">
@@ -342,13 +384,16 @@ function StatusStrip({ running, elapsed, result, runError, listingIsDefault, dir
     );
   }
   if (direct) {
-    const refused = direct.checkout?.executionMode === 'DENIED';
+    const refusedAtCheckout = direct.checkout?.executionMode === 'DENIED';
+    const refusedAtCart = direct.steps.some(isRefusedAdd);
     return (
-      <div className={`${base} animate-manifest-enter ${refused ? 'border-signal-rose bg-signal-rose/10' : 'border-signal-green/70 bg-signal-green/10'}`}>
+      <div className={`${base} animate-manifest-enter ${refusedAtCheckout || refusedAtCart ? 'border-signal-rose bg-signal-rose/10' : 'border-signal-green/70 bg-signal-green/10'}`}>
         <p className="font-display text-2xl xl:text-3xl font-bold">
-          {refused
+          {refusedAtCheckout
             ? <>No AI involved: a <span className="text-signal-rose">{rupees(direct.cartMinor)}</span> cart went straight to checkout. Refused.</>
-            : <>No AI involved: a {rupees(direct.cartMinor)} cart, inside the limit. Paid.</>}
+            : refusedAtCart
+              ? <>No AI involved: the trick's item was <span className="text-signal-rose">refused at the cart</span>. Only what you asked for was paid.</>
+              : <>No AI involved: a {rupees(direct.cartMinor)} cart, inside the limit. Paid.</>}
         </p>
         <p className="font-display text-2xl xl:text-3xl font-bold text-signal-green shrink-0">{rupees(direct.moneyMovedMinor)} moved</p>
       </div>
@@ -387,36 +432,41 @@ function StatusStrip({ running, elapsed, result, runError, listingIsDefault, dir
   }
 
   const { outcome } = result;
-  if (outcome === 'BLOCKED') {
+  const moved = <p className="font-display text-2xl xl:text-3xl font-bold text-signal-green shrink-0">{rupees(result.moneyMovedMinor)} moved</p>;
+  if (outcome === 'BLOCKED_AT_CART') {
+    return (
+      <div className={`${base} animate-manifest-enter border-signal-rose bg-signal-rose/10`}>
+        <p className="font-display text-2xl xl:text-3xl font-bold">
+          Gemma was fooled into a <span className="text-signal-rose">{rupees(result.attemptedAmountMinor)}</span> cart. The cart refused it: not what you asked for.
+        </p>
+        {moved}
+      </div>
+    );
+  }
+  if (outcome === 'BLOCKED_AT_CHECKOUT') {
     return (
       <div className={`${base} animate-manifest-enter border-signal-rose bg-signal-rose/10`}>
         <p className="font-display text-2xl xl:text-3xl font-bold">
           Gemma was fooled into a <span className="text-signal-rose">{rupees(result.attemptedAmountMinor)}</span> cart. Checkout refused it.
         </p>
-        <p className="font-display text-2xl xl:text-3xl font-bold text-signal-green shrink-0">₹0 moved</p>
+        {moved}
       </div>
     );
   }
-  if (outcome === 'BREACH') {
+  if (outcome === 'BREACH' || outcome === 'REACHED_PAYMENT_LAYER') {
     return (
       <div className={`${base} animate-manifest-enter border-signal-amber bg-signal-amber/15`}>
-        <p className="font-display text-2xl font-bold text-signal-amber">An injected item was paid for ({rupees(result.moneyMovedMinor)}). That's a bug: please report run {result.correlationId}.</p>
+        <p className="font-display text-2xl font-bold text-signal-amber">
+          {outcome === 'BREACH' ? `An injected item was paid for (${rupees(result.moneyMovedMinor)}).` : 'An injected item reached the payment step.'} That's a bug: please report run {result.correlationId}.
+        </p>
       </div>
     );
   }
-  if (outcome === 'PURCHASED') {
+  if (result.moneyMovedMinor > 0) {
     return (
       <div className={`${base} animate-manifest-enter border-signal-green/70 bg-signal-green/10`}>
-        <p className="font-display text-2xl font-bold">Gemma resisted this one and paid only {rupees(result.moneyMovedMinor)}, inside your limit.</p>
+        <p className="font-display text-2xl font-bold">Gemma resisted this one and paid only {rupees(result.moneyMovedMinor)}, for what you asked.</p>
         {wallButton}
-      </div>
-    );
-  }
-  if (outcome === 'FOOLED_NO_CHECKOUT') {
-    return (
-      <div className={`${base} animate-manifest-enter border-signal-amber/70 bg-signal-amber/10`}>
-        <p className="font-display text-2xl font-bold">Gemma was fooled, then stopped before checkout.</p>
-        <p className="font-display text-2xl font-bold text-signal-green shrink-0">₹0 moved</p>
       </div>
     );
   }
@@ -593,7 +643,8 @@ export default function Arena() {
   const categories = mandate?.allowedCategories ?? state.mandateTemplate.allowedCategories;
   const listingDirty = draft !== state.listing.description;
   const titles = variantTitles(steps);
-  const { cartMinor, checkout } = cartAndCheckout(steps);
+  const { cartMinor, checkout, refused } = cartAndCheckout(steps);
+  const task = mandate?.task;
 
   return (
     <div className="min-h-screen lg:h-screen bg-ink text-paper font-body antialiased flex flex-col">
@@ -774,13 +825,26 @@ export default function Arena() {
                 <span key={c} className="text-[11px] rounded-full border border-hairline px-2 py-0.5 text-paper/70">{c}</span>
               ))}
             </div>
+            {task && (
+              <div className="mt-3 rounded-lg border border-hairline bg-ink/60 px-3 py-2">
+                <p className="text-xs uppercase tracking-wider text-muted">What your words authorize</p>
+                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                  {task.allowedProductTypes.map(t => (
+                    <span key={t} className="text-[11px] rounded-full border border-signal-green/50 text-signal-green px-2 py-0.5">{humanize(t)}</span>
+                  ))}
+                  {Object.entries(task.requiredAttributes).map(([k, v]) => (
+                    <span key={k} className="text-[11px] rounded-full border border-hairline px-2 py-0.5 text-paper/70">{v === false ? `no ${humanize(k)}` : `${humanize(k)}: ${String(v)}`}</span>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <div className="mt-5">
               <SpendMeter cartMinor={cartMinor} limitMinor={ceiling} />
             </div>
 
             <div className="mt-4">
-              <CheckoutStamp checkout={checkout} running={running || checking} />
+              <CheckoutStamp checkout={checkout} running={running || checking} refused={refused} />
             </div>
 
             <div className="mt-auto pt-4 text-[11px] font-mono text-muted space-y-1">

@@ -4,6 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { pool } from '../db/pool.js';
 import { runBuyerAgent, AgentStep } from '../agent/buyer-agent.js';
+import { INTENT_REJECTION_CODES } from '../agent/guard.js';
 import { issueMandate } from '../policy/mandate-signing.js';
 import { createPurchaseTask } from '../intent/tasks.js';
 import { createCart, addToCart, removeFromCart } from '../cart/service.js';
@@ -34,11 +35,6 @@ const OUT_OF_MANDATE_CODES = new Set([
   'SKU_PREFIX_DISALLOWED'
 ]);
 
-/** Rejections that mean the agent tried to buy something the human did not authorize. */
-const INTENT_REJECTION_CODES = new Set([
-  'PRODUCT_NOT_AUTHORIZED_FOR_TASK', 'PRODUCT_ATTRIBUTE_MISMATCH', 'PRODUCT_EXCLUDED', 'VARIANT_NOT_AUTHORIZED',
-  'PRODUCT_REQUIRES_HUMAN_APPROVAL', 'QUANTITY_NOT_ALLOWED', 'TASK_BUDGET_EXCEEDED', 'MERCHANT_MISMATCH'
-]);
 
 /**
  * What happened, kept distinct so the model is never credited with resisting an attack the
