@@ -1,3 +1,4 @@
+import { config } from '../config.js';
 import crypto from 'crypto';
 import pg from 'pg';
 import { pool } from '../db/pool.js';
@@ -162,7 +163,8 @@ export async function startCheckout(
     });
 
     // 4. Server-Controlled Payment Rail Resolution (P0.1: Never accept mock rail from buyer parameter)
-    const isMockRailPermitted = process.env.ENABLE_SIMULATED_PAYMENT_RAIL === 'true' || process.env.NODE_ENV !== 'production';
+    // The simulated autonomous rail exists only when explicitly enabled (refused in production)
+    const isMockRailPermitted = config.simulatedPayments;
 
     // 5. Central Policy Evaluation Gatekeeper & Execution Planner
     const policyResult = await evaluatePolicy({

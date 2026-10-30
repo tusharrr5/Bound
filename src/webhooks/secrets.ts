@@ -21,6 +21,10 @@ export interface WebhookVerificationResult {
   secretVersion?: number;
   secretHandle?: string;
   isRotationGracePeriod?: boolean;
+  /** The secret that verified the signature. Server-internal; never returned to clients. */
+  secret?: string;
+  /** Merchant whose secret was used (null = platform-level secret). */
+  merchantId?: string | null;
   errorCode?: 'MISSING_SIGNATURE' | 'NO_ACTIVE_SECRETS' | 'HMAC_VERIFICATION_FAILED';
 }
 
@@ -120,9 +124,11 @@ export async function verifyWebhookSignatureWithRotation(
   const runner = txClient || pool;
 
   // 1. Fetch candidate secrets (PRIMARY first, then PREVIOUS_ACTIVE where NOW() <= valid_until)
+  // A known merchant may use its own secrets or the platform-level ones. With no merchant, only
+  // platform-level secrets apply: one merchant's secret must never authenticate another's event.
   const secretsRes = await runner.query(`
     SELECT * FROM webhook_secrets
-    WHERE ($1::uuid IS NULL OR merchant_id = $1 OR merchant_id IS NULL)
+    WHERE (($1::uuid IS NULL AND merchant_id IS NULL) OR ($1::uuid IS NOT NULL AND (merchant_id = $1 OR merchant_id IS NULL)))
       AND status IN ('PRIMARY', 'PREVIOUS_ACTIVE')
       AND (valid_until IS NULL OR valid_until >= NOW())
     ORDER BY CASE WHEN status = 'PRIMARY' THEN 0 ELSE 1 END, version DESC;
@@ -137,6 +143,8 @@ export async function verifyWebhookSignatureWithRotation(
       secretVersion: 1,
       secretHandle: 'env://RAZORPAY_WEBHOOK_SECRET',
       isRotationGracePeriod: false,
+      secret: isValid ? fallbackSecret : undefined,
+      merchantId: null,
       errorCode: isValid ? undefined : 'HMAC_VERIFICATION_FAILED'
     };
   }
@@ -152,7 +160,9 @@ export async function verifyWebhookSignatureWithRotation(
         valid: true,
         secretVersion: Number(row.version),
         secretHandle: row.secret_handle,
-        isRotationGracePeriod: row.status === 'PREVIOUS_ACTIVE'
+        isRotationGracePeriod: row.status === 'PREVIOUS_ACTIVE',
+        secret: resolvedSecret,
+        merchantId: row.merchant_id ?? null
       };
     }
   }
@@ -254,4 +264,19 @@ export async function rotateWebhookSecret(
   } finally {
     if (shouldManageTx) client.release();
   }
+}
+
+/**
+ * Verifies an inbound Razorpay webhook. The merchant is derived from the order the event refers
+ * to (stored razorpay_order_id), never from anything the sender claims, and only that merchant's
+ * secrets (or platform-level ones) are tried.
+ */
+export async function verifyRazorpayWebhook(rawBody: Buffer, signature: string, payload: any): Promise<WebhookVerificationResult> {
+  const orderId = payload?.payload?.payment?.entity?.order_id ?? payload?.payload?.order?.entity?.id ?? null;
+  let merchantId: string | undefined;
+  if (typeof orderId === 'string' && orderId.length <= 100) {
+    const res = await pool.query('SELECT merchant_id FROM orders WHERE razorpay_order_id = $1', [orderId]);
+    merchantId = res.rows[0]?.merchant_id;
+  }
+  return verifyWebhookSignatureWithRotation(rawBody, signature, merchantId);
 }

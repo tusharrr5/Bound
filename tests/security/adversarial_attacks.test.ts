@@ -13,6 +13,7 @@ import {
   extractPrincipal,
   requireHumanStepUpAuth
 } from '../../src/middleware/auth.js';
+import { config } from '../../src/config.js';
 import {
   createAgentDelegation,
   createPurchaseMandateFromDelegation,
@@ -145,35 +146,38 @@ describe('Security, Adversarial Attacks & Governance Test Suite', () => {
     expect(oRes.rows[0].merchant_id).not.toBe(merchantBId);
   });
 
-  it('Strips and drops spoofed x-buyer-agent-id / x-merchant-id headers from untrusted Internet clients (Auth Bypass Defense)', () => {
+  it('Rejects requests without credentials; spoofed identity headers never grant an identity', () => {
     const maliciousHeaders = {
       'x-buyer-agent-id': '99999999-9999-9999-9999-999999999999', // Spoofed victim agent ID
       'x-merchant-id': 'victim_merchant_uuid',                     // Spoofed victim tenant
       'x-principal-name': 'Fake Admin'
     };
 
-    const ctx = extractPrincipal(maliciousHeaders);
+    // Default: no sandbox identity exists, so an unauthenticated request is refused
+    expect(() => extractPrincipal(maliciousHeaders)).toThrow('Authentication required');
 
-    // Strict Invariant: Spoofed headers are completely stripped!
-    expect(ctx.agentId).not.toBe('99999999-9999-9999-9999-999999999999');
-    expect(ctx.agentId).toBe('22222222-2222-2222-2222-222222222222'); // Safe default sandbox
-    expect(ctx.merchantId).toBeUndefined(); // Untrusted merchant dropped
-    expect(ctx.authenticatedVia).toBe('SANDBOX_DEFAULT');
+    // Explicit sandbox mode (refused in production by config.ts): a fixed demo agent, headers still ignored
+    config.sandboxAuth = true;
+    try {
+      const ctx = extractPrincipal(maliciousHeaders);
+      expect(ctx.agentId).toBe('22222222-2222-2222-2222-222222222222');
+      expect(ctx.merchantId).toBeUndefined();
+      expect(ctx.authenticatedVia).toBe('SANDBOX_DEFAULT');
+    } finally {
+      config.sandboxAuth = false;
+    }
   });
 
-  it('Validates cryptographically signed Agent Identity Tokens (JWT) and rejects forged / expired tokens', () => {
+  it('Validates cryptographically signed Agent Identity Tokens (JWT) and rejects forged / expired tokens with no fallback', () => {
     const targetAgentId = '77777777-7777-7777-7777-777777777777';
-    const secret = 'manifest_agent_jwt_auth_secret_secure_key_2026';
 
-    // 1. Issue authentic token
+    // 1. Issue authentic token with the server's configured secret
     const token = issueAgentIdentityToken({
       agentId: targetAgentId,
       principalName: 'Rohan Gupta',
       merchantId: '11111111-1111-1111-1111-111111111111',
       validitySeconds: 3600
-    }, secret);
-
-    expect(token).toBeDefined();
+    });
 
     // 2. Extract principal from authentic token
     const ctx = extractPrincipal({ authorization: `Bearer ${token}` });
@@ -182,37 +186,29 @@ describe('Security, Adversarial Attacks & Governance Test Suite', () => {
     expect(ctx.principalName).toBe('Rohan Gupta');
     expect(ctx.merchantId).toBe('11111111-1111-1111-1111-111111111111');
 
-    // 3. Forged token with invalid signature
+    // 3. Forged token: rejected, and extractPrincipal does not fall back to any other identity
     const forgedToken = token.slice(0, -5) + 'xxxxx';
-    const forgedVerification = verifyAgentIdentityToken(forgedToken, secret);
-    expect(forgedVerification.valid).toBe(false);
-    expect(forgedVerification.error).toContain('INVALID_SIGNATURE');
+    expect(verifyAgentIdentityToken(forgedToken).error).toContain('INVALID_SIGNATURE');
+    expect(() => extractPrincipal({ authorization: `Bearer ${forgedToken}` })).toThrow('INVALID_SIGNATURE');
 
-    // 4. Expired token
-    const expiredToken = issueAgentIdentityToken({
-      agentId: targetAgentId,
-      principalName: 'Rohan Gupta',
-      validitySeconds: -60 // Expired 1 minute ago
-    }, secret);
+    // 4. A token signed with the old published default secret is worthless
+    const legacyToken = issueAgentIdentityToken({ agentId: targetAgentId, principalName: 'Attacker' }, 'manifest_agent_jwt_auth_secret_secure_key_2026');
+    expect(() => extractPrincipal({ authorization: `Bearer ${legacyToken}` })).toThrow('INVALID_SIGNATURE');
 
-    const expiredVerification = verifyAgentIdentityToken(expiredToken, secret);
-    expect(expiredVerification.valid).toBe(false);
-    expect(expiredVerification.error).toContain('TOKEN_EXPIRED');
+    // 5. Expired token
+    const expiredToken = issueAgentIdentityToken({ agentId: targetAgentId, principalName: 'Rohan Gupta', validitySeconds: -60 });
+    expect(verifyAgentIdentityToken(expiredToken).error).toContain('TOKEN_EXPIRED');
+    expect(() => extractPrincipal({ authorization: `Bearer ${expiredToken}` })).toThrow('TOKEN_EXPIRED');
   });
 
-  it('Accepts internal gateway identity headers ONLY when accompanied by verified Gateway Shared Secret', () => {
+  it('Ignores the retired x-gateway-secret header: identity headers are trusted only inside a signed gateway envelope', () => {
     const gatewayHeaders = {
-      'x-gateway-secret': 'trusted_internal_gateway_secret_key_xyz',
+      'x-gateway-secret': 'trusted_internal_gateway_secret_key_xyz', // the old published fallback secret
       'x-buyer-agent-id': '88888888-8888-8888-8888-888888888888',
       'x-principal-name': 'Verified Gateway Shopper',
       'x-merchant-id': '11111111-1111-1111-1111-111111111111'
     };
-
-    const ctx = extractPrincipal(gatewayHeaders);
-    expect(ctx.authenticatedVia).toBe('TRUSTED_GATEWAY');
-    expect(ctx.agentId).toBe('88888888-8888-8888-8888-888888888888');
-    expect(ctx.principalName).toBe('Verified Gateway Shopper');
-    expect(ctx.merchantId).toBe('11111111-1111-1111-1111-111111111111');
+    expect(() => extractPrincipal(gatewayHeaders)).toThrow('Authentication required');
   });
 
   it('Enforces Authorization Matrix: Prevents Agent Self-Delegation & Requires Human Step-Up WebAuthn/Passkey', async () => {
@@ -366,24 +362,25 @@ describe('Security, Adversarial Attacks & Governance Test Suite', () => {
     const body = { items: [{ sku: 'SONIC-H7-BLK', qty: 1 }] };
 
     // 1. Generate valid signed gateway headers
-    const signedHeaders = signGatewayRequest(method, path, body, 'agent_gateway_123', 'Siddharth Roy');
+    const gatewayAgent = 'abababab-abab-abab-abab-abababababab';
+    const signedHeaders = signGatewayRequest(method, path, body, gatewayAgent, 'Siddharth Roy');
 
-    // 2. Extract principal derives trusted identity from signed gateway
+    // 2. Extract principal derives trusted identity from the signed gateway envelope and consumes its nonce
     const principal = extractPrincipal(signedHeaders, { method, path, body });
     expect(principal.authenticatedVia).toBe('TRUSTED_GATEWAY');
-    expect(principal.agentId).toBe('agent_gateway_123');
+    expect(principal.agentId).toBe(gatewayAgent);
 
-    // 3. First explicit verification consumes nonce
-    const verifyResult = verifySignedGatewayRequest(signedHeaders, method, path, body);
-    expect(verifyResult.valid).toBe(true);
-
-    // 4. Replay attack with same nonce MUST FAIL
+    // 3–4. Replaying the same envelope MUST FAIL, through either entry point
+    expect(() => extractPrincipal(signedHeaders, { method, path, body })).toThrow('GATEWAY_REPLAY_ATTACK_DETECTED');
     const replayResult = verifySignedGatewayRequest(signedHeaders, method, path, body);
     expect(replayResult.valid).toBe(false);
     expect(replayResult.error).toBe('GATEWAY_REPLAY_ATTACK_DETECTED');
 
+    // A gateway envelope must name a real agent id
+    expect(() => extractPrincipal(signGatewayRequest(method, path, body, 'agent_gateway_123'), { method, path, body })).toThrow('must carry an agent id');
+
     // 5. Tampered body hash MUST FAIL
-    const signedHeaders2 = signGatewayRequest(method, path, body, 'agent_gateway_123');
+    const signedHeaders2 = signGatewayRequest(method, path, body, gatewayAgent);
     const tamperedBody = { items: [{ sku: 'SONIC-H7-BLK', qty: 999 }] };
     const tamperedResult = verifySignedGatewayRequest(signedHeaders2, method, path, tamperedBody);
     expect(tamperedResult.valid).toBe(false);

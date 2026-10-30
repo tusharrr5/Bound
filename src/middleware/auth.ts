@@ -1,6 +1,14 @@
 import crypto from 'crypto';
 import { FastifyRequest, FastifyReply } from 'fastify';
 import { pool } from '../db/pool.js';
+import { config } from '../config.js';
+
+/** Authentication failure carrying the HTTP status to return. */
+export class AuthError extends Error {
+  constructor(public statusCode: 401 | 403, public code: string, message: string) {
+    super(message);
+  }
+}
 
 export type PrincipalType = 'HUMAN_PRINCIPAL' | 'BUYER_AGENT' | 'SYSTEM';
 export type AuthLevel = 'STANDARD_SESSION' | 'STEP_UP_MFA_VERIFIED' | 'WEBAUTHN_PASSKEY';
@@ -43,8 +51,11 @@ declare module 'fastify' {
   }
 }
 
-const DEFAULT_AUTH_SECRET = process.env.AGENT_AUTH_SECRET || 'manifest_agent_jwt_auth_secret_secure_key_2026';
-const GATEWAY_SHARED_SECRET = process.env.GATEWAY_SHARED_SECRET || 'trusted_internal_gateway_secret_key_xyz';
+// From validated config: never a hardcoded value (random per process in development)
+const DEFAULT_AUTH_SECRET = config.authSecret;
+const GATEWAY_SHARED_SECRET = config.gatewaySecret;
+const SANDBOX_AGENT_ID = '22222222-2222-2222-2222-222222222222';
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function base64UrlEncode(str: string | Buffer): string {
   const buf = typeof str === 'string' ? Buffer.from(str, 'utf8') : str;
@@ -210,7 +221,14 @@ export function verifyIdentityToken(
 
 export const verifyAgentIdentityToken = verifyIdentityToken;
 
-const seenNonces = new Set<string>();
+// Gateway nonces seen recently (nonce → first-seen time). Entries outlive the 60 s freshness
+// window, so an old request can never be replayed after its nonce is pruned.
+const seenNonces = new Map<string, number>();
+const NONCE_RETENTION_MS = 5 * 60_000;
+
+function pruneNonces(now: number) {
+  for (const [n, t] of seenNonces) if (now - t > NONCE_RETENTION_MS) seenNonces.delete(n);
+}
 
 /**
  * Validates a signed gateway request using HMAC-SHA256 over timestamp, nonce, method, path, and body hash.
@@ -237,6 +255,7 @@ export function verifySignedGatewayRequest(
     return { valid: false, error: 'GATEWAY_TIMESTAMP_EXPIRED_OR_DRIFT' };
   }
 
+  pruneNonces(now);
   if (seenNonces.has(nonce)) {
     return { valid: false, error: 'GATEWAY_REPLAY_ATTACK_DETECTED' };
   }
@@ -255,8 +274,7 @@ export function verifySignedGatewayRequest(
   }
 
   if (options.consumeNonce !== false) {
-    seenNonces.add(nonce);
-    if (seenNonces.size > 10000) seenNonces.clear();
+    seenNonces.set(nonce, now);
   }
 
   return { valid: true };
@@ -295,86 +313,120 @@ export function signGatewayRequest(
 }
 
 /**
- * Extracts and verifies authenticated Principal context.
- * Strict Security Invariant:
- * - Direct client-supplied headers (e.g. `x-buyer-agent-id`, `x-merchant-id`) are STRICTLY STRIPPED / IGNORED
- *   unless authenticated with a verified `x-gateway-signature` or `x-gateway-secret` matching internal API Gateway key.
- * - Cryptographically verified Bearer tokens (JWT) are validated for signature, issuer, audience, exp, and scopes.
+ * Resolves the authenticated principal for a request, or throws AuthError. In order:
+ * 1. A bearer token verified for signature, issuer, audience, nbf and exp. An invalid token is
+ *    always rejected; it never falls back to another identity.
+ * 2. A signed gateway envelope (HMAC over timestamp, nonce, method, path, body). The nonce is
+ *    consumed, so the envelope works once. Identity headers are trusted only inside it.
+ * 3. No credentials: a fixed sandbox buyer agent ONLY when BOUND_SANDBOX_AUTH=true (never allowed
+ *    in production); otherwise 401. Client-supplied identity headers are never trusted.
+ * Call it once per request (the `authenticate` preHandler does) because step 2 consumes a nonce.
  */
 export function extractPrincipal(
   headers: Record<string, any>,
-  options: { strict?: boolean; method?: string; path?: string; body?: any } = {}
+  options: { method?: string; path?: string; body?: any } = {}
 ): PrincipalContext {
   const correlationId = (headers['x-correlation-id'] as string) || `sess_${Date.now()}`;
   const authHeader = headers['authorization'] as string | undefined;
 
-  // 1. Check for Cryptographically Verified Bearer Token
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const rawToken = authHeader.substring(7).trim();
-
-    if (rawToken.includes('.')) {
-      const verification = verifyIdentityToken(rawToken);
-      if (verification.valid && verification.claims) {
-        const c = verification.claims;
-        const isHuman = c.principal_type === 'HUMAN_PRINCIPAL';
-        return {
-          principalType: c.principal_type || (isHuman ? 'HUMAN_PRINCIPAL' : 'BUYER_AGENT'),
-          agentId: isHuman ? '22222222-2222-2222-2222-222222222222' : c.sub,
-          userId: isHuman ? c.sub : undefined,
-          principalName: c.principal_name,
-          authLevel: c.auth_level || (isHuman ? 'WEBAUTHN_PASSKEY' : 'STANDARD_SESSION'),
-          delegatedBy: c.principal_name,
-          delegationId: c.delegation_id,
-          merchantId: c.merchant_id,
-          scopes: c.scopes || ['catalog:read', 'cart:write', 'negotiate:write', 'checkout:write'],
-          sessionId: correlationId,
-          authenticatedVia: 'CRYPTOGRAPHIC_JWT'
-        };
-      } else {
-        if (options.strict) {
-          throw new Error(`UNAUTHORIZED: ${verification.error}`);
-        }
-      }
+  if (authHeader) {
+    if (!authHeader.startsWith('Bearer ')) throw new AuthError(401, 'UNSUPPORTED_AUTH_SCHEME', 'Use a Bearer token.');
+    const verification = verifyIdentityToken(authHeader.substring(7).trim());
+    if (!verification.valid || !verification.claims) {
+      throw new AuthError(401, 'INVALID_TOKEN', verification.error || 'Token verification failed.');
     }
+    const c = verification.claims;
+    const isHuman = c.principal_type === 'HUMAN_PRINCIPAL';
+    if (!isHuman && !UUID_RE.test(c.sub)) throw new AuthError(401, 'INVALID_TOKEN', 'Agent token subject must be an agent id.');
+    return {
+      principalType: isHuman ? 'HUMAN_PRINCIPAL' : 'BUYER_AGENT',
+      agentId: isHuman ? '' : c.sub,
+      userId: isHuman ? c.sub : undefined,
+      principalName: c.principal_name,
+      authLevel: c.auth_level || 'STANDARD_SESSION',
+      delegatedBy: c.principal_name,
+      delegationId: c.delegation_id,
+      merchantId: c.merchant_id,
+      scopes: Array.isArray(c.scopes) ? c.scopes : [],
+      sessionId: correlationId,
+      authenticatedVia: 'CRYPTOGRAPHIC_JWT'
+    };
   }
 
-  // 2. Check for Signed Internal API Gateway Envelope (HMAC over Timestamp + Nonce + Body)
-  const isSignedGateway = headers['x-gateway-signature'] && verifySignedGatewayRequest(headers, options.method || 'POST', options.path || '/', options.body || {}, { consumeNonce: false }).valid;
-  const legacyGatewaySecret = headers['x-gateway-secret'] as string | undefined;
-  const isTrustedGateway = isSignedGateway || (legacyGatewaySecret && legacyGatewaySecret === GATEWAY_SHARED_SECRET);
-
-  if (isTrustedGateway) {
-    const agentId = (headers['x-buyer-agent-id'] as string) || '22222222-2222-2222-2222-222222222222';
-    const principalName = (headers['x-principal-name'] as string) || 'Principal Shopper Account';
-    const merchantId = headers['x-merchant-id'] as string | undefined;
-
+  if (headers['x-gateway-signature']) {
+    const check = verifySignedGatewayRequest(headers, options.method || 'POST', options.path || '/', options.body || {});
+    if (!check.valid) throw new AuthError(401, 'INVALID_GATEWAY_SIGNATURE', check.error || 'Gateway signature rejected.');
+    const agentId = headers['x-buyer-agent-id'] as string | undefined;
+    if (!agentId || !UUID_RE.test(agentId)) throw new AuthError(401, 'INVALID_GATEWAY_IDENTITY', 'Gateway envelope must carry an agent id.');
+    const principalName = (headers['x-principal-name'] as string) || 'Gateway principal';
     return {
       principalType: 'BUYER_AGENT',
       agentId,
       principalName,
       delegatedBy: principalName,
       authLevel: 'STANDARD_SESSION',
-      merchantId,
+      merchantId: headers['x-merchant-id'] as string | undefined,
       scopes: ['catalog:read', 'cart:write', 'negotiate:write', 'checkout:write'],
       sessionId: correlationId,
       authenticatedVia: 'TRUSTED_GATEWAY'
     };
   }
 
-  // 3. Fallback: Untrusted headers are STRICTLY STRIPPED / DROPPED
-  const defaultAgentId = '22222222-2222-2222-2222-222222222222';
-  const defaultPrincipal = 'Principal Shopper Account';
+  if (config.sandboxAuth) {
+    return {
+      principalType: 'BUYER_AGENT',
+      agentId: SANDBOX_AGENT_ID,
+      principalName: 'Principal Shopper Account',
+      delegatedBy: 'Principal Shopper Account',
+      authLevel: 'STANDARD_SESSION',
+      merchantId: undefined,
+      scopes: ['catalog:read', 'cart:write', 'negotiate:write', 'checkout:write'],
+      sessionId: correlationId,
+      authenticatedVia: 'SANDBOX_DEFAULT'
+    };
+  }
 
-  return {
-    principalType: 'BUYER_AGENT',
-    agentId: defaultAgentId,
-    principalName: defaultPrincipal,
-    delegatedBy: defaultPrincipal,
-    authLevel: 'STANDARD_SESSION',
-    merchantId: undefined,
-    scopes: ['catalog:read', 'cart:write', 'negotiate:write', 'checkout:write'],
-    sessionId: correlationId,
-    authenticatedVia: 'SANDBOX_DEFAULT'
+  throw new AuthError(401, 'UNAUTHENTICATED', 'Authentication required.');
+}
+
+/** Fastify preHandler: resolves the principal once and attaches it to the request. */
+export async function authenticate(req: FastifyRequest, reply: FastifyReply) {
+  if (req.principal) return;
+  try {
+    req.principal = extractPrincipal(req.headers, { method: req.method || 'GET', path: (req.url || '/').split('?')[0], body: req.body });
+  } catch (err) {
+    const e = err instanceof AuthError ? err : new AuthError(401, 'UNAUTHENTICATED', 'Authentication required.');
+    return reply.status(e.statusCode).send({ ok: false, code: e.code, error: e.message });
+  }
+}
+
+/** Fastify preHandler factory: an authenticated buyer agent holding `scope`. */
+export function requireAgent(scope: string) {
+  return async (req: FastifyRequest, reply: FastifyReply) => {
+    await authenticate(req, reply);
+    if (reply.sent) return;
+    const p = req.principal!;
+    if (p.principalType !== 'BUYER_AGENT' || !p.agentId) {
+      return reply.status(403).send({ ok: false, code: 'AGENT_REQUIRED', error: 'This operation is performed by a buyer agent.' });
+    }
+    if (!p.scopes.includes(scope)) {
+      return reply.status(403).send({ ok: false, code: 'MISSING_SCOPE', error: `Missing scope ${scope}.` });
+    }
+  };
+}
+
+/** Fastify preHandler factory: an authenticated human principal holding `scope`. */
+export function requireHuman(scope: string) {
+  return async (req: FastifyRequest, reply: FastifyReply) => {
+    await authenticate(req, reply);
+    if (reply.sent) return;
+    const p = req.principal!;
+    if (p.principalType !== 'HUMAN_PRINCIPAL') {
+      return reply.status(403).send({ ok: false, code: 'HUMAN_REQUIRED', error: 'This operation requires a human principal.' });
+    }
+    if (!p.scopes.includes(scope)) {
+      return reply.status(403).send({ ok: false, code: 'MISSING_SCOPE', error: `Missing scope ${scope}.` });
+    }
   };
 }
 
@@ -383,8 +435,9 @@ export function extractPrincipal(
  * Blocks autonomous agents from attempting self-delegation or expanding their own limits.
  */
 export async function requireHumanStepUpAuth(req: FastifyRequest, reply: FastifyReply) {
-  const principal = req.principal || extractPrincipal(req.headers);
-  req.principal = principal;
+  await authenticate(req, reply);
+  if (reply.sent) return;
+  const principal = req.principal!;
 
   // Authorization Matrix Rule 1: Buyer Agents can NEVER create, modify or expand delegations
   if (principal.principalType === 'BUYER_AGENT') {
@@ -435,18 +488,5 @@ export async function validateAgentAndDelegation(principal: PrincipalContext): P
   return true;
 }
 
-/**
- * Fastify preHandler middleware to attach verified PrincipalContext.
- */
-export async function authenticateAgentPrincipal(req: FastifyRequest, reply: FastifyReply) {
-  try {
-    req.principal = extractPrincipal(req.headers);
-  } catch (err: any) {
-    return reply.status(401).send({
-      type: 'https://manifest.commerce/errors/UNAUTHORIZED',
-      title: 'Agent Authentication Failed',
-      status: 401,
-      detail: err.message
-    });
-  }
-}
+/** Kept for existing imports; use `authenticate`. */
+export const authenticateAgentPrincipal = authenticate;

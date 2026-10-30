@@ -1,13 +1,53 @@
 import Razorpay from 'razorpay';
-import dotenv from 'dotenv';
+import { config } from '../../config.js';
 
-dotenv.config();
+/**
+ * The ONLY file permitted to import or instantiate the Razorpay SDK.
+ *
+ * Three modes, chosen once:
+ * - razorpay:     real keys are configured. Every provider error is thrown as a
+ *                 PaymentProviderError; an error is never reported as authorized, captured
+ *                 or processed.
+ * - simulated:    no keys and BOUND_SIMULATED_PAYMENTS=true (refused in production). Returns
+ *                 synthetic results marked `simulated: true`, with ids prefixed `order_sim_`,
+ *                 `rfnd_sim_`, so they can never be mistaken for provider records.
+ * - unconfigured: no keys and no simulation. Every call fails.
+ */
 
-// The ONLY file permitted to import or instantiate the Razorpay SDK
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_manifest2026',
-  key_secret: process.env.RAZORPAY_KEY_SECRET || 'demo_secret_key_12345',
-});
+export class PaymentProviderError extends Error {
+  constructor(
+    /** REJECTED: the provider answered no. UNAVAILABLE: no answer, outcome unknown. NOT_CONFIGURED: no keys. */
+    public kind: 'REJECTED' | 'UNAVAILABLE' | 'NOT_CONFIGURED',
+    message: string
+  ) {
+    super(message);
+    this.name = 'PaymentProviderError';
+  }
+}
+
+const isRealKey = (v?: string) => !!v && !/your_|manifest2026|demo_secret/i.test(v);
+const keysConfigured = isRealKey(process.env.RAZORPAY_KEY_ID) && isRealKey(process.env.RAZORPAY_KEY_SECRET);
+
+export const razorpayMode: 'razorpay' | 'simulated' | 'unconfigured' =
+  keysConfigured ? 'razorpay' : config.simulatedPayments ? 'simulated' : 'unconfigured';
+
+const razorpay = keysConfigured
+  ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID!, key_secret: process.env.RAZORPAY_KEY_SECRET! })
+  : null;
+
+function client(): Razorpay {
+  if (!razorpay) throw new PaymentProviderError('NOT_CONFIGURED', 'Razorpay keys are not configured.');
+  return razorpay;
+}
+
+/** Maps an SDK error to rejected (4xx: the provider decided) or unavailable (anything else: unknown). */
+function providerError(op: string, err: any): PaymentProviderError {
+  const status = Number(err?.statusCode ?? err?.status);
+  const detail = err?.error?.description || err?.message || String(err);
+  return new PaymentProviderError(status >= 400 && status < 500 ? 'REJECTED' : 'UNAVAILABLE', `Razorpay ${op} failed: ${detail}`);
+}
+
+const simId = (prefix: string) => `${prefix}_sim_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
 export interface CreateRazorpayOrderParams {
   amountMinor: number;
@@ -23,21 +63,19 @@ export interface RazorpayOrderResult {
   currency: string;
   receipt: string;
   checkoutUrl?: string;
+  /** True when no provider was called. */
+  simulated?: boolean;
 }
 
-export async function createRazorpayOrder(
-  params: CreateRazorpayOrderParams
-): Promise<RazorpayOrderResult> {
+export async function createRazorpayOrder(params: CreateRazorpayOrderParams): Promise<RazorpayOrderResult> {
   const currency = params.currency || 'INR';
   const receipt = params.receipt || `rcpt_${Date.now()}`;
+  if (razorpayMode === 'simulated') {
+    const id = simId('order');
+    return { id, orderId: id, amountMinor: params.amountMinor, currency, receipt, checkoutUrl: `/checkout/hosted/${id}`, simulated: true };
+  }
   try {
-    const order = await razorpay.orders.create({
-      amount: params.amountMinor,
-      currency,
-      receipt,
-      notes: params.notes || {}
-    });
-
+    const order = await client().orders.create({ amount: params.amountMinor, currency, receipt, notes: params.notes || {} });
     return {
       id: order.id,
       orderId: order.id,
@@ -46,120 +84,73 @@ export async function createRazorpayOrder(
       receipt: order.receipt || receipt,
       checkoutUrl: `/checkout/hosted/${order.id}`
     };
-  } catch (err: any) {
-    console.warn('⚠️ Razorpay live API call failed (using test mock order fallback):', err.message || err);
-    const mockOrderId = `order_test_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-    return {
-      id: mockOrderId,
-      orderId: mockOrderId,
-      amountMinor: params.amountMinor,
-      currency,
-      receipt,
-      checkoutUrl: `/checkout/hosted/${mockOrderId}`
-    };
+  } catch (err) {
+    throw err instanceof PaymentProviderError ? err : providerError('order creation', err);
   }
 }
 
 /**
- * Authoritatively fetches current payment status from Razorpay API.
- * Prevents race conditions where webhook payment.authorized arrives while payment is already captured.
+ * Authoritatively fetches current payment status from Razorpay. Throws if the provider cannot
+ * answer: callers must treat that as unknown, never as authorized.
  */
-export async function fetchRazorpayPayment(paymentId: string): Promise<{ id: string; status: string; amount: number; currency: string }> {
+export async function fetchRazorpayPayment(paymentId: string): Promise<{ id: string; status: string; amount: number; currency: string; simulated?: boolean }> {
+  if (razorpayMode === 'simulated') {
+    // The simulated provider never auto-captures: a payment stays authorized until captured
+    return { id: paymentId, status: 'authorized', amount: 0, currency: 'INR', simulated: true };
+  }
   try {
-    const payment = await razorpay.payments.fetch(paymentId);
-    return {
-      id: payment.id,
-      status: payment.status,
-      amount: Number(payment.amount),
-      currency: payment.currency
-    };
-  } catch (err: any) {
-    // In test environment or offline simulation fallback
-    return {
-      id: paymentId,
-      status: 'authorized',
-      amount: 0,
-      currency: 'INR'
-    };
+    const payment = await client().payments.fetch(paymentId);
+    return { id: payment.id, status: payment.status, amount: Number(payment.amount), currency: payment.currency };
+  } catch (err) {
+    throw err instanceof PaymentProviderError ? err : providerError('payment fetch', err);
   }
 }
 
-/**
- * Explicitly captures an authorized payment under manual capture mode.
- */
-export async function captureRazorpayPayment(paymentId: string, amountMinor: number, currency: string = 'INR'): Promise<{ id: string; status: string }> {
+/** Captures an authorized payment. A failure throws; it is never reported as captured. */
+export async function captureRazorpayPayment(paymentId: string, amountMinor: number, currency: string = 'INR'): Promise<{ id: string; status: string; simulated?: boolean }> {
+  if (razorpayMode === 'simulated') return { id: paymentId, status: 'captured', simulated: true };
   try {
-    const payment = await razorpay.payments.capture(paymentId, amountMinor, currency);
-    return {
-      id: payment.id,
-      status: payment.status
-    };
-  } catch (err: any) {
-    return {
-      id: paymentId,
-      status: 'captured'
-    };
+    const payment = await client().payments.capture(paymentId, amountMinor, currency);
+    return { id: payment.id, status: payment.status };
+  } catch (err) {
+    throw err instanceof PaymentProviderError ? err : providerError('capture', err);
   }
 }
 
-/**
- * Idempotently executes a refund against Razorpay API.
- */
+/** Requests a refund. A failure throws (callers mark the refund uncertain); it is never reported as processed. */
 export async function createRazorpayRefund(params: {
   paymentId: string;
   amountMinor: number;
   receipt?: string;
   notes?: Record<string, any>;
-}): Promise<{ id: string; status: string; amount: number }> {
+}): Promise<{ id: string; status: string; amount: number; simulated?: boolean }> {
+  if (razorpayMode === 'simulated') {
+    return { id: simId('rfnd'), status: 'processed', amount: params.amountMinor, simulated: true };
+  }
   try {
-    const refund = await (razorpay.payments as any).refund(params.paymentId, {
+    const refund = await (client().payments as any).refund(params.paymentId, {
       amount: params.amountMinor,
       receipt: params.receipt || `rcpt_rfnd_${Date.now()}`,
       notes: params.notes || {}
     });
-    return {
-      id: refund.id,
-      status: refund.status || 'processed',
-      amount: Number(refund.amount)
-    };
-  } catch (err: any) {
-    if (err.message && (err.message.includes('timeout') || err.message.includes('ECONNRESET') || err.message.includes('ETIMEDOUT') || err.message.includes('UNCERTAIN_SIMULATED'))) {
-      throw err; // Let caller handle network uncertainty
-    }
-    // Fallback simulation for test environment
-    const mockRefundId = `rfnd_mock_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-    return {
-      id: mockRefundId,
-      status: 'processed',
-      amount: params.amountMinor
-    };
+    if (!refund?.id || !refund?.status) throw new PaymentProviderError('UNAVAILABLE', 'Razorpay refund response had no id or status.');
+    return { id: refund.id, status: refund.status, amount: Number(refund.amount) };
+  } catch (err) {
+    throw err instanceof PaymentProviderError ? err : providerError('refund', err);
   }
 }
 
-/**
- * Fetches current refund status from Razorpay API for reconciliation.
- */
-export async function fetchRazorpayRefund(refundId: string, paymentId?: string): Promise<{ id: string; status: string; amount: number }> {
+/** Fetches a refund's status for reconciliation. Throws if the provider cannot answer. */
+export async function fetchRazorpayRefund(refundId: string, paymentId?: string): Promise<{ id: string; status: string; amount: number; simulated?: boolean }> {
+  if (razorpayMode === 'simulated') return { id: refundId, status: 'processed', amount: 0, simulated: true };
   try {
-    if (paymentId && (razorpay.payments as any).fetchRefund) {
-      const refund = await (razorpay.payments as any).fetchRefund(paymentId, refundId);
-      return {
-        id: refund.id,
-        status: refund.status || 'processed',
-        amount: Number(refund.amount)
-      };
-    }
-    const refund = await (razorpay as any).refunds?.fetch(refundId);
-    return {
-      id: refund.id,
-      status: refund.status || 'processed',
-      amount: Number(refund.amount)
-    };
-  } catch (err: any) {
-    return {
-      id: refundId,
-      status: 'processed',
-      amount: 0
-    };
+    const api = client() as any;
+    const refund = paymentId && api.payments.fetchRefund
+      ? await api.payments.fetchRefund(paymentId, refundId)
+      : await api.refunds?.fetch(refundId);
+    if (!refund?.id || !refund?.status) throw new PaymentProviderError('UNAVAILABLE', 'Razorpay refund response had no id or status.');
+    return { id: refund.id, status: refund.status, amount: Number(refund.amount) };
+  } catch (err) {
+    throw err instanceof PaymentProviderError ? err : providerError('refund fetch', err);
   }
 }

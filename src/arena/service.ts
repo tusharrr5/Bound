@@ -109,14 +109,28 @@ let runInProgress = false;
  * human's device key; its private half is discarded after signing. A goal that does not map to
  * exactly one intent is refused: in a real product a human would confirm it first.
  */
-async function createArenaMandate(correlationId: string, goal: string): Promise<ArenaMandate> {
+export async function createTaskBoundMandate(params: {
+  correlationId: string;
+  goal: string;
+  buyerAgentId?: string;
+  principalId?: string;
+  ceilingMinor?: number;
+  allowedCategories?: string[];
+  ttlMs?: number;
+}): Promise<ArenaMandate> {
+  const agentId = params.buyerAgentId ?? ARENA_AGENT_ID;
+  const ceiling = params.ceilingMinor ?? ARENA_MANDATE_CEILING_MINOR;
+  const categories = params.allowedCategories ?? ARENA_ALLOWED_CATEGORIES;
+  const ttlMs = params.ttlMs ?? ARENA_MANDATE_TTL_MS;
+  const correlationId = params.correlationId;
+  const goal = params.goal;
   const task = await createPurchaseTask({
-    principalId: 'arena-demo-principal',
-    buyerAgentId: ARENA_AGENT_ID,
+    principalId: params.principalId ?? 'arena-demo-principal',
+    buyerAgentId: agentId,
     merchantId: MERCHANT_ID,
     request: goal,
-    maxBudgetMinor: ARENA_MANDATE_CEILING_MINOR,
-    ttlMs: ARENA_MANDATE_TTL_MS,
+    maxBudgetMinor: ceiling,
+    ttlMs,
     correlationId
   });
   if (task.status !== 'ACTIVE') {
@@ -132,7 +146,7 @@ async function createArenaMandate(correlationId: string, goal: string): Promise<
   });
   const mandateTokenId = `mandate_${correlationId}`;
   const keyId = `key_${mandateTokenId}`;
-  const expiresAt = new Date(Date.now() + ARENA_MANDATE_TTL_MS);
+  const expiresAt = new Date(Date.now() + ttlMs);
   let signature = '';
 
   const client = await pool.connect();
@@ -140,24 +154,24 @@ async function createArenaMandate(correlationId: string, goal: string): Promise<
     await client.query('BEGIN');
     // Drop keys from Arena runs whose mandates have long expired
     await client.query(`
-      DELETE FROM mandate_key_bindings WHERE buyer_agent_id = $1 AND created_at < NOW() - INTERVAL '2 hours';
-    `, [ARENA_AGENT_ID]);
+      DELETE FROM mandate_key_bindings WHERE buyer_agent_id = $1 AND key_id LIKE 'key_mandate_%' AND created_at < NOW() - INTERVAL '2 hours';
+    `, [agentId]);
     await client.query(`
       INSERT INTO mandate_key_bindings (buyer_agent_id, key_id, public_key, algorithm, status)
       VALUES ($1, $2, $3, 'Ed25519', 'ACTIVE');
-    `, [ARENA_AGENT_ID, keyId, publicKey]);
+    `, [agentId, keyId, publicKey]);
     ({ signature } = await issueMandate({
       privateKeyPem: privateKey,
       mandate_token_id: mandateTokenId,
-      buyer_agent_id: ARENA_AGENT_ID,
+      buyer_agent_id: agentId,
       merchant_id: MERCHANT_ID,
       key_id: keyId,
       purchase_task_id: task.id,
       intent_hash: task.intentHash,
-      max_total_amount_minor: ARENA_MANDATE_CEILING_MINOR,
-      per_txn_limit_minor: ARENA_MANDATE_CEILING_MINOR,
+      max_total_amount_minor: ceiling,
+      per_txn_limit_minor: ceiling,
       currency: 'INR',
-      allowed_categories: ARENA_ALLOWED_CATEGORIES,
+      allowed_categories: categories,
       allowed_sku_prefixes: [],
       delegation_id: null,
       delegation_version: null,
@@ -175,8 +189,8 @@ async function createArenaMandate(correlationId: string, goal: string): Promise<
 
   return {
     mandateTokenId,
-    ceilingMinor: ARENA_MANDATE_CEILING_MINOR,
-    allowedCategories: ARENA_ALLOWED_CATEGORIES,
+    ceilingMinor: ceiling,
+    allowedCategories: categories,
     expiresAt: expiresAt.toISOString(),
     signature,
     publicKeyFingerprint: crypto.createHash('sha256').update(publicKey).digest('hex').slice(0, 16),
@@ -268,7 +282,7 @@ export async function runArena(params: { goal?: string } = {}): Promise<ArenaRun
 
   try {
     const listing = await getBaitListing();
-    const mandate = await createArenaMandate(correlationId, goal);
+    const mandate = await createTaskBoundMandate({ correlationId, goal });
     broadcastArenaEvent('run_started', { correlationId, goal, mandate, listingDescription: listing.description });
 
     const agentResult = await runBuyerAgent(goal, {
@@ -428,7 +442,7 @@ export async function runDirectCheck(params: { includePayload?: boolean } = {}):
   const correlationId = `direct_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
 
   try {
-    const mandate = await createArenaMandate(correlationId, DEFAULT_ARENA_GOAL);
+    const mandate = await createTaskBoundMandate({ correlationId, goal: DEFAULT_ARENA_GOAL });
     const bait = await getBaitListing();
     const steps: AgentStep[] = [];
     const push = (step: Omit<AgentStep, 'stepIndex'>) => steps.push({ stepIndex: steps.length + 1, ...step });
