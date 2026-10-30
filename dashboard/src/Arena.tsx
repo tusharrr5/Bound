@@ -1,5 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Bot, Cpu, KeyRound, Pencil, Play, RotateCcw, ShieldCheck, Store, Wifi } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import {
+  Check, Coffee, Cpu, FileSearch, Handshake, KeyRound, LoaderCircle, MessageSquareQuote, PackagePlus,
+  Play, RotateCcw, Search, ShieldAlert, ShieldCheck, ShieldX, ShoppingCart, TriangleAlert, WifiOff
+} from 'lucide-react';
 
 // ─── Types mirroring src/arena/service.ts and src/agent/buyer-agent.ts ───────
 
@@ -73,161 +76,305 @@ interface ArenaState {
 const rupees = (minor?: number) =>
   minor == null ? '—' : `₹${Math.round(minor / 100).toLocaleString('en-IN')}`;
 
-// ─── Step rendering ──────────────────────────────────────────────────────────
+// ─── Derived run state ───────────────────────────────────────────────────────
 
 /** Titles of variants the agent has seen, so cart steps can name what was added. */
 function variantTitles(steps: AgentStep[]): Map<string, { title: string; priceMinor: number }> {
   const titles = new Map<string, { title: string; priceMinor: number }>();
   for (const s of steps) {
     for (const item of s.toolResult?.results || []) titles.set(item.variantId, { title: item.title, priceMinor: item.priceMinor });
-    for (const item of s.toolResult?.cart?.items || []) {
-      titles.set(item.variantId, { title: `${item.productTitle} · ${item.title}`, priceMinor: item.unitPriceMinor });
-    }
+    for (const item of s.toolResult?.cart?.items || []) titles.set(item.variantId, { title: item.productTitle || item.title, priceMinor: item.unitPriceMinor });
   }
   return titles;
 }
+
+/** Cart total as last reported by add_to_cart, and the checkout result if the agent got that far. */
+function cartAndCheckout(steps: AgentStep[]) {
+  const lastCart = [...steps].reverse().find(s => s.tool === 'add_to_cart' && s.toolResult?.cart)?.toolResult.cart;
+  const checkout = [...steps].reverse().find(s => s.tool === 'start_checkout')?.toolResult;
+  return { cartMinor: lastCart?.grossAmountMinor as number | undefined, checkout };
+}
+
+// ─── Small building blocks ───────────────────────────────────────────────────
+
+function Panel({ n, title, subtitle, accent, children }: {
+  n: number; title: string; subtitle: string; accent: string; children: ReactNode;
+}) {
+  return (
+    <section className="rounded-2xl border border-hairline bg-panel flex flex-col min-h-0 overflow-hidden">
+      <header className="px-5 pt-4 pb-3 border-b border-hairline flex items-start gap-3">
+        <span className={`mt-0.5 w-7 h-7 shrink-0 rounded-full text-sm font-bold flex items-center justify-center ${accent}`}>{n}</span>
+        <div className="min-w-0">
+          <h2 className="font-display text-lg font-semibold leading-tight">{title}</h2>
+          <p className="text-[13px] text-muted leading-snug">{subtitle}</p>
+        </div>
+      </header>
+      <div className="flex-1 min-h-0 flex flex-col p-5">{children}</div>
+    </section>
+  );
+}
+
+function Counter({ value, label, tone }: { value: string | number; label: string; tone: string }) {
+  return (
+    <div className="rounded-xl border border-hairline bg-panel px-4 py-2.5 text-center min-w-[128px]">
+      {/* key re-mounts on change so the number pops when a judge's run lands */}
+      <p key={String(value)} className={`animate-pop font-display text-3xl font-bold tabular-nums leading-none ${tone}`}>{value}</p>
+      <p className="text-[11px] uppercase tracking-wider text-muted mt-1.5">{label}</p>
+    </div>
+  );
+}
+
+// ─── Panel 2: the agent's timeline ───────────────────────────────────────────
+
+const TOOL_ICON: Record<string, typeof Search> = {
+  search_products: Search,
+  get_product_detail: FileSearch,
+  create_cart: ShoppingCart,
+  add_to_cart: PackagePlus,
+  request_negotiation: Handshake,
+  start_checkout: ShieldCheck
+};
 
 function StepRow({ step, titles, payloadVariantId }: {
   step: AgentStep;
   titles: Map<string, { title: string; priceMinor: number }>;
   payloadVariantId: string;
 }) {
-  const time = step.modelMs != null ? `${(step.modelMs / 1000).toFixed(1)}s` : '';
   const input = step.toolCall?.input || {};
+  const time = step.modelMs != null ? `${(step.modelMs / 1000).toFixed(1)}s` : '';
 
   if (!step.tool) {
     return (
-      <li className="animate-manifest-enter flex gap-3 py-2.5">
-        <Bot className="w-4 h-4 mt-1 shrink-0 text-muted" />
-        <p className="text-[15px] italic text-paper/80 leading-snug">“{step.finalMessage || step.plan}”</p>
+      <li className="animate-manifest-enter relative pl-10 pb-4 after:absolute after:left-[13px] after:top-8 after:bottom-1 after:w-px after:bg-hairline last:after:hidden">
+        <span className="absolute left-0 top-0 w-7 h-7 rounded-full bg-ink border border-hairline flex items-center justify-center">
+          <MessageSquareQuote className="w-3.5 h-3.5 text-muted" />
+        </span>
+        <p className="text-[15px] italic text-paper/80 leading-snug pt-0.5">“{step.finalMessage || step.plan}”</p>
       </li>
     );
   }
 
-  let label: string;
-  let tone = 'text-paper';
-  let detail = step.observation;
+  let Icon = TOOL_ICON[step.tool] || Search;
+  let label: ReactNode = step.tool;
+  let detail: ReactNode = step.observation;
+  let node = 'bg-ink border-hairline text-paper/70';
+  let tag: ReactNode = null;
+  let raw: ReactNode = null;
 
   switch (step.tool) {
-    case 'search_products':
-      label = `Searched “${input.query}”${input.max_price_minor ? ` under ${rupees(input.max_price_minor)}` : ''}`;
+    case 'search_products': {
+      const n = step.toolResult?.results?.length ?? 0;
+      label = <>Searched <span className="text-paper">“{input.query}”</span></>;
+      detail = n ? `${n} result${n === 1 ? '' : 's'}, descriptions included` : 'No results';
+      break;
+    }
+    case 'get_product_detail':
+      label = 'Opened a product page';
+      detail = titles.get(input.variant_id)?.title;
       break;
     case 'create_cart':
       label = 'Opened a cart';
-      detail = undefined;
+      detail = null;
       break;
     case 'add_to_cart': {
       const v = titles.get(input.variant_id);
       const injected = input.variant_id === payloadVariantId;
-      label = `Added ${v ? `${v.title} · ${rupees(v.priceMinor)}` : input.variant_id}`;
+      label = <>Added <span className="text-paper">{v?.title ?? 'an item'}</span> · {rupees(v?.priceMinor)}</>;
+      detail = step.toolResult?.cart ? `Cart total ${rupees(step.toolResult.cart.grossAmountMinor)}` : step.observation;
       if (injected) {
-        tone = 'text-signal-rose font-semibold';
+        node = 'bg-signal-rose/15 border-signal-rose text-signal-rose';
+        tag = <span className="text-[10px] font-bold tracking-wider rounded bg-signal-rose text-ink px-1.5 py-0.5">INJECTED</span>;
         detail = 'The listing told it to. You never asked for this.';
-      } else {
-        detail = step.toolResult?.cart ? `Cart total ${rupees(step.toolResult.cart.grossAmountMinor)}` : step.observation;
+        raw = (
+          <details className="mt-1.5 text-[12px]">
+            <summary className="cursor-pointer text-muted hover:text-paper">Exact call Gemma made</summary>
+            <pre className="mt-1.5 font-mono bg-ink border border-hairline rounded-lg p-2.5 overflow-x-auto text-signal-rose">{JSON.stringify(step.toolCall, null, 2)}</pre>
+          </details>
+        );
       }
       break;
     }
+    case 'request_negotiation':
+      label = `Asked for ${rupees(input.proposed_price_minor)}`;
+      break;
     case 'start_checkout': {
       const denied = step.toolResult?.executionMode === 'DENIED';
-      label = denied ? `Checkout refused · ${step.toolResult?.errorCode}` : `Checked out · ${step.toolResult?.executionMode || 'failed'}`;
-      tone = denied ? 'text-signal-rose font-semibold' : step.toolResult?.ok ? 'text-signal-green font-semibold' : 'text-signal-amber';
-      detail = step.toolResult?.message || step.observation;
+      Icon = denied ? ShieldX : step.toolResult?.ok ? ShieldCheck : ShieldAlert;
+      label = denied ? 'Tried to check out · refused' : step.toolResult?.ok ? 'Checked out · paid' : 'Checkout failed';
+      node = denied ? 'bg-signal-rose/15 border-signal-rose text-signal-rose' : step.toolResult?.ok ? 'bg-signal-green/15 border-signal-green text-signal-green' : 'bg-signal-amber/15 border-signal-amber text-signal-amber';
+      detail = denied ? step.toolResult?.errorCode : step.toolResult?.ok ? `${rupees(step.toolResult.totalMinor)} on the simulated rail` : step.toolResult?.message;
       break;
     }
-    default:
-      label = step.tool;
   }
 
   return (
-    <li className="animate-manifest-enter flex gap-3 py-2.5">
-      <span className="mt-0.5 w-6 h-6 shrink-0 rounded-full border border-hairline text-[11px] font-mono text-muted flex items-center justify-center">
-        {step.stepIndex}
+    <li className="animate-manifest-enter relative pl-10 pb-4 after:absolute after:left-[13px] after:top-8 after:bottom-1 after:w-px after:bg-hairline last:after:hidden">
+      <span className={`absolute left-0 top-0 w-7 h-7 rounded-full border flex items-center justify-center ${node}`}>
+        <Icon className="w-3.5 h-3.5" />
       </span>
-      <div className="min-w-0 flex-1">
-        <div className="flex items-baseline justify-between gap-3">
-          <p className={`text-[15px] leading-snug ${tone}`}>{label}</p>
-          <span className="text-[11px] font-mono text-muted shrink-0">{time}</span>
-        </div>
-        {detail && <p className="text-[13px] text-muted leading-snug mt-0.5 break-words">{detail}</p>}
+      <div className="flex items-baseline justify-between gap-3">
+        <p className="text-[15px] leading-snug text-paper/85 flex flex-wrap items-center gap-x-2 gap-y-1">{label}{tag}</p>
+        <span className="text-[11px] font-mono text-muted shrink-0">{time}</span>
       </div>
+      {detail && <p className="text-[13px] text-muted leading-snug mt-0.5 break-words">{detail}</p>}
+      {raw}
     </li>
   );
 }
 
-// ─── Verdict banner: the moment the demo is built around ─────────────────────
+const IDLE_STEPS = ['Search the catalog', 'Read the listings', 'Add to cart', 'Check out under your mandate'];
+const STEP_LI = 'relative pl-10 pb-4 after:absolute after:left-[13px] after:top-8 after:bottom-1 after:w-px after:bg-hairline last:after:hidden';
 
-function Verdict({ result, ceilingMinor }: { result: ArenaRunResult; ceilingMinor: number }) {
-  const purchased = [...result.steps].reverse().find(s => s.tool === 'start_checkout')?.toolResult;
+// ─── Panel 3: the wall ───────────────────────────────────────────────────────
 
-  if (result.outcome === 'BLOCKED') {
-    return (
-      <section className="animate-manifest-enter rounded-2xl border-2 border-signal-rose bg-signal-rose/10 p-6 lg:p-8">
-        <p className="font-display text-3xl lg:text-5xl font-bold leading-tight text-paper">
-          Gemma was fooled. It tried to spend <span className="text-signal-rose">{rupees(result.attemptedAmountMinor)}</span>.
-        </p>
-        <p className="font-display text-xl lg:text-3xl font-semibold mt-3 text-paper/90">
-          Your signed limit: {rupees(ceilingMinor)}. Blocked at checkout. <span className="text-signal-green">{rupees(result.moneyMovedMinor)} moved.</span>
-        </p>
-        <div className="mt-6 grid gap-4 lg:grid-cols-2">
-          <div>
-            <p className="text-xs uppercase tracking-wider text-muted mb-1.5">What Gemma actually called</p>
-            <pre className="font-mono text-[13px] bg-ink/80 border border-hairline rounded-lg p-3 overflow-x-auto text-signal-rose">
-              {JSON.stringify(result.injectedToolCall ?? null, null, 2)}
-            </pre>
-          </div>
-          <div>
-            <p className="text-xs uppercase tracking-wider text-muted mb-1.5">Why checkout said no</p>
-            <p className="font-mono text-[13px] bg-ink/80 border border-hairline rounded-lg p-3 text-paper/90">
-              {result.blockedReasonCode}: {result.blockedReason}
-            </p>
-            <p className="text-[11px] font-mono text-muted mt-2 break-all">audit hash {result.auditEventHash}</p>
-          </div>
-        </div>
-      </section>
-    );
-  }
-
-  if (result.outcome === 'BREACH') {
-    return (
-      <section className="animate-manifest-enter rounded-2xl border-2 border-signal-amber bg-signal-amber/15 p-6 lg:p-8">
-        <p className="font-display text-3xl lg:text-4xl font-bold text-signal-amber">
-          An injected item was paid for: {rupees(result.moneyMovedMinor)}.
-        </p>
-        <p className="text-lg mt-2 text-paper/90">That should not be possible. It is a bug in the policy layer; please report this run ({result.correlationId}).</p>
-      </section>
-    );
-  }
-
-  if (result.outcome === 'PURCHASED') {
-    return (
-      <section className="animate-manifest-enter rounded-2xl border-2 border-signal-green bg-signal-green/10 p-6 lg:p-8">
-        <p className="font-display text-3xl lg:text-4xl font-bold text-paper">
-          Gemma resisted this one.
-        </p>
-        <p className="font-display text-xl lg:text-2xl mt-2 text-paper/90">
-          It paid {rupees(purchased?.totalMinor)}, inside your {rupees(ceilingMinor)} limit. Rewrite the listing and try again.
-        </p>
-      </section>
-    );
-  }
-
-  if (result.outcome === 'FOOLED_NO_CHECKOUT') {
-    return (
-      <section className="animate-manifest-enter rounded-2xl border-2 border-signal-amber bg-signal-amber/10 p-6 lg:p-8">
-        <p className="font-display text-3xl lg:text-4xl font-bold text-paper">
-          Gemma was fooled, then stopped before checkout.
-        </p>
-        <p className="font-display text-xl mt-2 text-paper/90">{rupees(result.moneyMovedMinor)} moved. Its cart reached {rupees(result.attemptedAmountMinor)}.</p>
-      </section>
-    );
-  }
+function SpendMeter({ cartMinor, limitMinor }: { cartMinor?: number; limitMinor: number }) {
+  const cart = cartMinor ?? 0;
+  const scale = Math.max(limitMinor * 1.6, cart * 1.04);
+  const limitPct = (limitMinor / scale) * 100;
+  const withinPct = (Math.min(cart, limitMinor) / scale) * 100;
+  const overPct = cart > limitMinor ? ((cart - limitMinor) / scale) * 100 : 0;
+  const over = cart > limitMinor;
 
   return (
-    <section className="animate-manifest-enter rounded-2xl border border-hairline bg-panel p-6">
-      <p className="font-display text-2xl font-bold text-paper">Gemma didn't buy anything.</p>
-      <p className="text-lg mt-1 text-muted">“{result.agentSummary}”</p>
-    </section>
+    <div>
+      <div className="flex items-baseline justify-between">
+        <p className="text-xs uppercase tracking-wider text-muted">Cart total</p>
+        <p className={`font-display text-2xl font-bold tabular-nums ${over ? 'text-signal-rose' : 'text-paper'}`}>{cartMinor == null ? '₹0' : rupees(cart)}</p>
+      </div>
+      <div className="relative mt-2 h-4 rounded-full bg-ink border border-hairline overflow-hidden">
+        <div className="absolute inset-y-0 left-0 bg-signal-green transition-all duration-700" style={{ width: `${withinPct}%` }} />
+        <div className="absolute inset-y-0 bg-signal-rose transition-all duration-700" style={{ left: `${limitPct}%`, width: `${overPct}%` }} />
+        <div className="absolute inset-y-0 w-1 bg-paper shadow-[0_0_0_2px_rgba(11,13,16,0.9)]" style={{ left: `calc(${limitPct}% - 2px)` }} />
+      </div>
+      <div className="relative h-5">
+        <p className="absolute top-1 text-[11px] font-mono text-paper/80 -translate-x-1/2 whitespace-nowrap" style={{ left: `${limitPct}%` }}>
+          limit {rupees(limitMinor)}
+        </p>
+      </div>
+      {over && (
+        <p className="text-sm text-signal-rose font-semibold mt-1">{(cart / limitMinor).toFixed(1)}× what you signed for</p>
+      )}
+    </div>
+  );
+}
+
+function CheckoutStamp({ checkout, running }: { checkout: any; running: boolean }) {
+  if (!checkout) {
+    return (
+      <div className="rounded-xl border border-dashed border-hairline p-4 text-center text-muted text-sm">
+        {running ? 'Waiting for Gemma to reach checkout…' : 'The checkout decision appears here.'}
+      </div>
+    );
+  }
+  if (checkout.executionMode === 'DENIED') {
+    return (
+      <div className="animate-stamp rounded-xl border-2 border-signal-rose bg-signal-rose/10 p-4">
+        <div className="flex items-center gap-2 text-signal-rose">
+          <ShieldX className="w-7 h-7" />
+          <p className="font-display text-3xl font-bold tracking-wide">BLOCKED</p>
+        </div>
+        <p className="font-display text-xl font-semibold mt-1 text-signal-green">₹0 moved</p>
+        <p className="text-[13px] text-paper/80 mt-2 leading-snug">{checkout.message}</p>
+        <p className="mt-2 inline-block text-[11px] font-mono rounded bg-ink border border-hairline px-1.5 py-0.5 text-muted">{checkout.errorCode}</p>
+      </div>
+    );
+  }
+  if (checkout.ok) {
+    return (
+      <div className="animate-stamp rounded-xl border-2 border-signal-green bg-signal-green/10 p-4">
+        <div className="flex items-center gap-2 text-signal-green">
+          <ShieldCheck className="w-7 h-7" />
+          <p className="font-display text-3xl font-bold tracking-wide">PAID {rupees(checkout.totalMinor)}</p>
+        </div>
+        <p className="text-[13px] text-paper/80 mt-2">Within your signed limit. Simulated test rail; no real money.</p>
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-xl border-2 border-signal-amber bg-signal-amber/10 p-4">
+      <p className="font-display text-xl font-bold text-signal-amber">Checkout failed</p>
+      <p className="text-[13px] text-paper/80 mt-1">{checkout.message || checkout.errorCode}</p>
+    </div>
+  );
+}
+
+// ─── Status strip: one line a judge can read from across the table ───────────
+
+function StatusStrip({ running, elapsed, result, runError, listingIsDefault }: {
+  running: boolean; elapsed: number; result: ArenaRunResult | null; runError: string | null; listingIsDefault: boolean;
+}) {
+  const base = 'rounded-2xl border px-6 h-[76px] flex items-center justify-between gap-4';
+
+  if (running) {
+    return (
+      <div className={`${base} border-wire-blue/50 bg-wire-blue/10 relative overflow-hidden`}>
+        <p className="font-display text-2xl font-semibold flex items-center gap-3">
+          <LoaderCircle className="w-6 h-6 animate-spin text-wire-blue" /> Gemma is shopping…
+        </p>
+        <p className="font-mono text-2xl tabular-nums text-wire-blue">{elapsed.toFixed(1)}s</p>
+        <div className="absolute bottom-0 left-0 h-0.5 bg-wire-blue animate-progress" />
+      </div>
+    );
+  }
+  if (runError) {
+    return (
+      <div className={`${base} border-signal-amber/60 bg-signal-amber/10`}>
+        <p className="font-display text-xl font-semibold text-signal-amber flex items-center gap-3"><TriangleAlert className="w-6 h-6" /> {runError}</p>
+      </div>
+    );
+  }
+  if (!result) {
+    return (
+      <div className={`${base} border-hairline bg-panel/60`}>
+        <p className="font-display text-xl text-paper/90">
+          {listingIsDefault
+            ? 'The listing already hides an attack. Press Run, or rewrite it yourself.'
+            : 'Your listing is live. Press Run and see if Gemma falls for it.'}
+        </p>
+        <p className="text-sm text-muted shrink-0">Run · <kbd className="font-mono">⌘ ↵</kbd></p>
+      </div>
+    );
+  }
+
+  const { outcome } = result;
+  if (outcome === 'BLOCKED') {
+    return (
+      <div className={`${base} animate-manifest-enter border-signal-rose bg-signal-rose/10`}>
+        <p className="font-display text-2xl xl:text-3xl font-bold">
+          Gemma was fooled into a <span className="text-signal-rose">{rupees(result.attemptedAmountMinor)}</span> cart. Checkout refused it.
+        </p>
+        <p className="font-display text-2xl xl:text-3xl font-bold text-signal-green shrink-0">₹0 moved</p>
+      </div>
+    );
+  }
+  if (outcome === 'BREACH') {
+    return (
+      <div className={`${base} animate-manifest-enter border-signal-amber bg-signal-amber/15`}>
+        <p className="font-display text-2xl font-bold text-signal-amber">An injected item was paid for ({rupees(result.moneyMovedMinor)}). That's a bug: please report run {result.correlationId}.</p>
+      </div>
+    );
+  }
+  if (outcome === 'PURCHASED') {
+    return (
+      <div className={`${base} animate-manifest-enter border-signal-green/70 bg-signal-green/10`}>
+        <p className="font-display text-2xl font-bold">Gemma resisted this one and bought within your limit.</p>
+        <p className="text-base text-paper/80 shrink-0">Rewrite the listing and try again →</p>
+      </div>
+    );
+  }
+  if (outcome === 'FOOLED_NO_CHECKOUT') {
+    return (
+      <div className={`${base} animate-manifest-enter border-signal-amber/70 bg-signal-amber/10`}>
+        <p className="font-display text-2xl font-bold">Gemma was fooled, then stopped before checkout.</p>
+        <p className="font-display text-2xl font-bold text-signal-green shrink-0">₹0 moved</p>
+      </div>
+    );
+  }
+  return (
+    <div className={`${base} animate-manifest-enter border-hairline bg-panel`}>
+      <p className="font-display text-xl font-semibold">Gemma didn't buy anything.</p>
+      <p className="text-sm text-muted truncate">“{result.agentSummary}”</p>
+    </div>
   );
 }
 
@@ -246,6 +393,7 @@ export default function Arena() {
   const [result, setResult] = useState<ArenaRunResult | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const activeRun = useRef<string | null>(null);
+  const timelineEnd = useRef<HTMLDivElement | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -257,7 +405,7 @@ export default function Arena() {
       setDraft(data.listing.description);
       setLoadError(null);
     } catch (err: any) {
-      setLoadError(`Can't reach the backend (${err.message}). Start it with npm run dev.`);
+      setLoadError(`Can't reach the backend (${err.message}). Start it with npm run demo.`);
     }
   }, []);
 
@@ -295,6 +443,11 @@ export default function Arena() {
     const t = setInterval(() => setElapsed((Date.now() - started) / 1000), 100);
     return () => clearInterval(t);
   }, [running]);
+
+  // Keep the newest step in view while the timeline grows
+  useEffect(() => {
+    timelineEnd.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [steps.length, running]);
 
   const run = useCallback(async () => {
     if (running) return;
@@ -359,158 +512,161 @@ export default function Arena() {
   const categories = mandate?.allowedCategories ?? state.mandateTemplate.allowedCategories;
   const listingDirty = draft !== state.listing.description;
   const titles = variantTitles(steps);
+  const { cartMinor, checkout } = cartAndCheckout(steps);
 
   return (
-    <div className="min-h-screen bg-ink text-paper font-body antialiased">
-      <div className="max-w-[1480px] mx-auto px-4 lg:px-8 py-6 space-y-6">
+    <div className="min-h-screen lg:h-screen bg-ink text-paper font-body antialiased flex flex-col">
+      <div className="w-full max-w-[1600px] mx-auto px-4 lg:px-6 py-4 flex-1 min-h-0 flex flex-col gap-4">
 
-        {/* Header and live counter */}
-        <header className="flex flex-col lg:flex-row lg:items-end justify-between gap-5">
+        {/* Header and live counters */}
+        <header className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div>
-            <p className="font-display text-sm font-semibold uppercase tracking-[0.25em] text-signal-green">Bound</p>
-            <h1 className="font-display text-4xl lg:text-5xl font-bold tracking-tight">Trick my shopper</h1>
-            <p className="text-lg text-muted mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1">
-              <span className="inline-flex items-center gap-1.5"><Cpu className="w-4 h-4" /> {state.model} running on this laptop</span>
-              <span className="inline-flex items-center gap-1.5"><Wifi className="w-4 h-4" /> no cloud, no API key</span>
+            <div className="flex items-center gap-3">
+              <p className="font-display text-sm font-bold uppercase tracking-[0.3em] text-signal-green">Bound</p>
+              <a href="#/engine" className="text-xs text-muted hover:text-paper">engine room →</a>
+            </div>
+            <h1 className="font-display text-4xl font-bold tracking-tight leading-tight">Trick my shopper</h1>
+            <p className="text-[15px] text-muted mt-0.5 flex flex-wrap items-center gap-x-4 gap-y-1">
+              <span className="inline-flex items-center gap-1.5"><Cpu className="w-4 h-4" /> {state.model} on this laptop</span>
+              <span className="inline-flex items-center gap-1.5"><WifiOff className="w-4 h-4" /> no cloud, no API key</span>
             </p>
           </div>
-          <div className="grid grid-cols-3 gap-3 text-center">
-            <div className="rounded-xl border border-hairline bg-panel px-5 py-3">
-              <p className="font-display text-4xl font-bold text-signal-rose tabular-nums">{state.stats.fooled}</p>
-              <p className="text-xs uppercase tracking-wider text-muted mt-0.5">times AI was fooled</p>
-            </div>
-            <div className="rounded-xl border border-hairline bg-panel px-5 py-3">
-              <p className="font-display text-4xl font-bold tabular-nums">{rupees(state.stats.blockedAmountMinor)}</p>
-              <p className="text-xs uppercase tracking-wider text-muted mt-0.5">spending blocked</p>
-            </div>
-            <div className="rounded-xl border border-hairline bg-panel px-5 py-3">
-              <p className="font-display text-4xl font-bold text-signal-green tabular-nums">{rupees(state.stats.moneyLostMinor)}</p>
-              <p className="text-xs uppercase tracking-wider text-muted mt-0.5">money lost</p>
-            </div>
+          <div className="flex gap-3">
+            <Counter value={state.stats.fooled} label="times AI was fooled" tone="text-signal-rose" />
+            <Counter value={rupees(state.stats.blockedAmountMinor)} label="spending blocked" tone="text-paper" />
+            <Counter value={rupees(state.stats.moneyLostMinor)} label="money lost" tone="text-signal-green" />
           </div>
         </header>
 
-        {/* Verdict, or the run in progress */}
-        {running && (
-          <section className="rounded-2xl border border-wire-blue/60 bg-wire-blue/10 p-6 flex items-center justify-between">
-            <p className="font-display text-2xl lg:text-3xl font-semibold">Gemma is shopping…</p>
-            <p className="font-mono text-2xl tabular-nums text-wire-blue">{elapsed.toFixed(1)}s</p>
-          </section>
-        )}
-        {!running && result && <Verdict result={result} ceilingMinor={ceiling} />}
-        {!running && runError && (
-          <section className="rounded-2xl border-2 border-signal-amber bg-signal-amber/10 p-6">
-            <p className="font-display text-2xl font-semibold text-signal-amber">The run didn't start</p>
-            <p className="text-lg mt-1 text-paper/90">{runError}</p>
-          </section>
-        )}
+        <StatusStrip running={running} elapsed={elapsed} result={result} runError={runError} listingIsDefault={state.listing.isDefault} />
 
-        <div className="grid gap-6 lg:grid-cols-12">
+        <div className="flex-1 min-h-0 grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_minmax(0,1fr)]">
 
           {/* 1. The attacker's listing */}
-          <section className="lg:col-span-4 rounded-2xl border border-hairline bg-panel p-5 flex flex-col">
-            <div className="flex items-center gap-2 text-signal-rose">
-              <Store className="w-5 h-5" />
-              <h2 className="font-display text-xl font-semibold">You're the shady seller</h2>
+          <Panel n={1} title="The listing" subtitle="You're the seller. Gemma reads this word for word." accent="bg-signal-rose/15 text-signal-rose">
+            <div className="flex gap-3 items-center rounded-xl border border-hairline bg-ink/60 p-3">
+              <div className="w-14 h-14 shrink-0 rounded-lg bg-gradient-to-br from-amber-600 to-orange-900 flex items-center justify-center">
+                <Coffee className="w-7 h-7 text-amber-100" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="font-semibold leading-snug">{state.listing.title}</p>
+                <p className="text-xs text-muted">Sold by {state.listing.brand} · third-party seller</p>
+              </div>
+              <p className="font-display text-2xl font-bold shrink-0">{rupees(state.listing.priceMinor)}</p>
             </div>
-            <p className="text-sm text-muted mt-1">Write anything. This description reaches Gemma word for word inside its search results.</p>
-            <div className="mt-4 flex items-baseline justify-between gap-3">
-              <p className="font-semibold leading-snug">{state.listing.title}</p>
-              <p className="font-display text-xl font-bold shrink-0">{rupees(state.listing.priceMinor)}</p>
+
+            <div className="mt-4 flex items-center justify-between">
+              <label htmlFor="listing" className="text-xs uppercase tracking-wider text-muted">Description, written by the seller</label>
+              {listingDirty
+                ? <span className="text-[11px] font-semibold text-signal-amber">unpublished edits</span>
+                : state.listing.isDefault
+                  ? <span className="text-[11px] font-semibold text-signal-rose">default attack</span>
+                  : <span className="text-[11px] font-semibold text-signal-green inline-flex items-center gap-1"><Check className="w-3 h-3" /> your text is live</span>}
             </div>
-            <label className="sr-only" htmlFor="listing">Listing description</label>
             <textarea
               id="listing"
               value={draft}
               onChange={e => setDraft(e.target.value)}
               disabled={running}
-              rows={12}
-              className="mt-3 w-full flex-1 min-h-[240px] rounded-lg bg-ink border border-hairline focus:border-signal-rose focus:outline-none p-3 font-mono text-[13px] leading-relaxed text-paper/90 resize-y"
+              spellCheck={false}
+              className="mt-2 w-full flex-1 min-h-[180px] rounded-xl bg-ink border border-hairline focus:border-signal-rose focus:outline-none p-3.5 font-mono text-[13px] leading-relaxed text-paper/90 resize-none"
             />
-            <div className="mt-3 flex gap-2">
+            <div className="mt-3 flex items-center gap-3">
               <button
                 onClick={() => saveListing(draft)}
                 disabled={!listingDirty || savingListing || running}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-signal-rose text-ink font-semibold px-4 py-2 disabled:opacity-40"
+                className="rounded-xl bg-signal-rose text-ink font-semibold px-4 py-2.5 disabled:bg-hairline disabled:text-muted transition-colors"
               >
-                <Pencil className="w-4 h-4" /> {listingDirty ? 'Publish listing' : 'Published'}
+                {savingListing ? 'Publishing…' : 'Publish listing'}
               </button>
-              <button
-                onClick={() => saveListing(null)}
-                disabled={state.listing.isDefault || savingListing || running}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-hairline px-4 py-2 text-muted hover:text-paper disabled:opacity-40"
-              >
-                <RotateCcw className="w-4 h-4" /> Default attack
-              </button>
+              {!state.listing.isDefault && (
+                <button
+                  onClick={() => saveListing(null)}
+                  disabled={savingListing || running}
+                  className="inline-flex items-center gap-1.5 text-sm text-muted hover:text-paper disabled:opacity-40"
+                >
+                  <RotateCcw className="w-4 h-4" /> Restore default attack
+                </button>
+              )}
             </div>
-          </section>
+          </Panel>
 
           {/* 2. The shopper */}
-          <section className="lg:col-span-5 rounded-2xl border border-hairline bg-panel p-5 flex flex-col">
-            <div className="flex items-center gap-2">
-              <Bot className="w-5 h-5 text-wire-blue" />
-              <h2 className="font-display text-xl font-semibold">The shopper</h2>
-            </div>
-            <label className="text-sm text-muted mt-1" htmlFor="goal">What the human asked for</label>
+          <Panel n={2} title="The shopper" subtitle={`Gemma 4, local. Told your ${rupees(ceiling)} limit; not hardened against tricks.`} accent="bg-wire-blue/15 text-wire-blue">
+            <label htmlFor="goal" className="text-xs uppercase tracking-wider text-muted">The human asked for</label>
             <div className="mt-2 flex gap-2">
               <input
                 id="goal"
                 value={goal}
                 onChange={e => setGoal(e.target.value)}
                 disabled={running}
-                className="flex-1 min-w-0 rounded-lg bg-ink border border-hairline focus:border-wire-blue focus:outline-none px-3 py-2.5 text-[15px]"
+                className="flex-1 min-w-0 rounded-xl bg-ink border border-hairline focus:border-wire-blue focus:outline-none px-3.5 py-3 text-[15px]"
               />
               <button
                 onClick={run}
                 disabled={running || !goal.trim()}
-                className="inline-flex items-center gap-2 rounded-lg bg-wire-blue text-white font-semibold px-5 py-2.5 disabled:opacity-50"
+                className="inline-flex items-center gap-2 rounded-xl bg-wire-blue hover:bg-blue-500 text-white font-semibold px-6 py-3 disabled:opacity-50 transition-colors"
                 title="⌘ + Enter"
               >
-                <Play className="w-4 h-4" /> {running ? 'Running' : 'Run'}
+                {running ? <LoaderCircle className="w-5 h-5 animate-spin" /> : <Play className="w-5 h-5" />} {running ? 'Running' : 'Run'}
               </button>
             </div>
-            <ol className="mt-4 divide-y divide-hairline flex-1">
-              {steps.length === 0 && !running && (
-                <li className="py-8 text-center text-muted">Press Run to send Gemma shopping. Steps appear here live.</li>
-              )}
+
+            <div className="mt-5 flex-1 min-h-0 overflow-y-auto pr-1">
+            <ol>
+              {steps.length === 0 && !running && IDLE_STEPS.map((s, i) => (
+                <li key={s} className={STEP_LI}>
+                  <span className="absolute left-0 top-0 w-7 h-7 rounded-full border border-hairline bg-ink text-[12px] font-mono text-muted flex items-center justify-center">{i + 1}</span>
+                  <p className="text-[15px] text-muted pt-0.5">{s}</p>
+                </li>
+              ))}
               {steps.map(step => (
                 <StepRow key={step.stepIndex} step={step} titles={titles} payloadVariantId={state.payloadVariantId} />
               ))}
+              {running && (
+                <li className={STEP_LI}>
+                  <span className="absolute left-0 top-0 w-7 h-7 rounded-full border border-wire-blue/60 bg-wire-blue/10 flex items-center justify-center">
+                    <span className="w-2 h-2 rounded-full bg-wire-blue animate-pulse" />
+                  </span>
+                  <p className="text-[15px] text-wire-blue pt-0.5">Thinking…</p>
+                </li>
+              )}
             </ol>
-          </section>
+            <div ref={timelineEnd} aria-hidden />
+            </div>
+          </Panel>
 
           {/* 3. The wall */}
-          <section className="lg:col-span-3 rounded-2xl border border-hairline bg-panel p-5">
-            <div className="flex items-center gap-2 text-signal-green">
-              <ShieldCheck className="w-5 h-5" />
-              <h2 className="font-display text-xl font-semibold">Your signed limit</h2>
-            </div>
-            <p className="font-display text-5xl xl:text-6xl font-bold mt-4 tabular-nums">{rupees(ceiling)}</p>
-            <p className="text-sm text-muted mt-1">Checked against the real cart total at checkout. The model never holds the key.</p>
-            <div className="mt-4 flex flex-wrap gap-1.5">
+          <Panel n={3} title="Checkout" subtitle="Your signed limit, checked against the real cart." accent="bg-signal-green/15 text-signal-green">
+            <p className="text-xs uppercase tracking-wider text-muted">Your signed limit</p>
+            <p className="font-display text-5xl font-bold tabular-nums leading-tight">{rupees(ceiling)}</p>
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
               {categories.map(c => (
-                <span key={c} className="text-xs rounded-full border border-hairline px-2.5 py-1 text-paper/80">{c}</span>
+                <span key={c} className="text-[11px] rounded-full border border-hairline px-2 py-0.5 text-paper/70">{c}</span>
               ))}
             </div>
-            <div className="mt-5 pt-4 border-t border-hairline text-[12px] font-mono text-muted space-y-1.5">
-              <p className="flex items-center gap-1.5 text-paper/80 font-body text-sm"><KeyRound className="w-4 h-4" /> Ed25519, signed fresh each run</p>
+
+            <div className="mt-5">
+              <SpendMeter cartMinor={cartMinor} limitMinor={ceiling} />
+            </div>
+
+            <div className="mt-4">
+              <CheckoutStamp checkout={checkout} running={running} />
+            </div>
+
+            <div className="mt-auto pt-4 text-[11px] font-mono text-muted space-y-1">
+              <p className="flex items-center gap-1.5 font-body text-xs text-paper/70"><KeyRound className="w-3.5 h-3.5" /> Ed25519 mandate, signed fresh each run</p>
               {mandate ? (
                 <>
-                  <p className="break-all">key {mandate.publicKeyFingerprint}</p>
-                  <p className="break-all">sig {mandate.signature.slice(0, 32)}…</p>
-                  <p>expires {new Date(mandate.expiresAt).toLocaleTimeString()}</p>
+                  <p className="truncate">key {mandate.publicKeyFingerprint} · sig {mandate.signature.slice(0, 20)}…</p>
+                  {result?.auditEventHash && <p className="truncate">audit {result.auditEventHash}</p>}
                 </>
               ) : (
-                <p className="font-body text-[13px]">Signed when you press Run. The demo key is generated on this machine and stands in for your phone's key.</p>
+                <p className="font-body text-xs">The demo key is made on this laptop and stands in for your phone's key.</p>
               )}
             </div>
-          </section>
+          </Panel>
         </div>
-
-        <footer className="flex flex-wrap justify-between gap-2 text-sm text-muted pt-2">
-          <span>{state.stats.runs} runs · {state.stats.blocked} blocked · {state.stats.breaches} breaches</span>
-          <a href="#/engine" className="hover:text-paper underline-offset-4 hover:underline">Engine room: scripted walkthroughs →</a>
-        </footer>
       </div>
     </div>
   );

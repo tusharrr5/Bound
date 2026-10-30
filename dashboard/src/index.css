@@ -42,3 +42,37 @@
 ::-webkit-scrollbar-thumb:hover {
   background: #3B424D;
 }
+
+/* Arena: counter number pops when a run lands */
+@keyframes pop {
+  0% { transform: scale(1); }
+  40% { transform: scale(1.25); }
+  100% { transform: scale(1); }
+}
+.animate-pop {
+  animation: pop 450ms ease-out;
+}
+
+/* Arena: checkout verdict lands like a stamp */
+@keyframes stamp {
+  0% { opacity: 0; transform: scale(1.12); }
+  60% { opacity: 1; transform: scale(0.98); }
+  100% { opacity: 1; transform: scale(1); }
+}
+.animate-stamp {
+  animation: stamp 320ms ease-out forwards;
+}
+
+/* Arena: indeterminate progress line under the running strip */
+@keyframes progress {
+  0% { width: 0; left: 0; }
+  50% { width: 60%; left: 20%; }
+  100% { width: 0; left: 100%; }
+}
+.animate-progress {
+  animation: progress 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-pop, .animate-stamp, .animate-progress, .animate-manifest-enter { animation: none; }
+}
