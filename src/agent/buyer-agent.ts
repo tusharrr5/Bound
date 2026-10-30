@@ -133,6 +133,8 @@ export async function runBuyerAgent(
     spendingLimitMinor?: number;
     /** Called as each step completes, for live streaming. */
     onStep?: (step: AgentStep) => void;
+    /** Purchase task the run's carts are bound to (set by the server, never by the model). */
+    purchaseTaskId?: string;
   } = {}
 ): Promise<BuyerAgentRunResult> {
   const buyerAgentId = options.buyerAgentId || '22222222-2222-2222-2222-222222222222';
@@ -193,7 +195,7 @@ export async function runBuyerAgent(
       let result: any;
       try {
         input = parseToolArguments(call.function.arguments);
-        result = await executeToolCall(name, input, correlationId, principal);
+        result = await executeToolCall(name, input, correlationId, principal, { purchaseTaskId: options.purchaseTaskId });
       } catch (err: any) {
         result = { ok: false, error: err.message || String(err) };
       }

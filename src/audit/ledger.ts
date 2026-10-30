@@ -56,18 +56,9 @@ export function getMerchantCheckpointKeyPair() {
  * Standard RFC 8785 / JCS JSON Canonicalization.
  * Produces deterministic byte representations regardless of key insertion order.
  */
-export function canonicalJson(obj: any): string {
-  if (obj === null || obj === undefined) return 'null';
-  if (typeof obj !== 'object') return JSON.stringify(obj);
-  if (Array.isArray(obj)) {
-    return '[' + obj.map(canonicalJson).join(',') + ']';
-  }
-  const sortedKeys = Object.keys(obj)
-    .filter(k => obj[k] !== undefined)
-    .sort();
-  const pairs = sortedKeys.map(k => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`);
-  return '{' + pairs.join(',') + '}';
-}
+// Moved to crypto/canonical.ts so intent, mandate and Merkle code can share it without import cycles
+export { canonicalJson } from '../crypto/canonical.js';
+import { canonicalJson } from '../crypto/canonical.js';
 
 /**
  * Computes cryptographically bound SHA-256 hash across previous hash and event fields.

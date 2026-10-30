@@ -1,6 +1,30 @@
 import { pool } from './pool.js';
 import { ARENA_AGENT_ID, ARENA_PRINCIPAL_NAME, arenaProducts } from '../arena/catalog.js';
+import { issueMandate } from '../policy/mandate-signing.js';
 import crypto from 'crypto';
+
+/**
+ * Merchant-verified product types and attributes, keyed by sku_prefix. This is the trusted
+ * metadata intent authorization reads; titles and seller descriptions are never used for it.
+ */
+export const PRODUCT_TAXONOMY: Record<string, { productType: string; verifiedAttributes: Record<string, unknown> }> = {
+  'BREW-42': { productType: 'espresso_machine', verifiedAttributes: { plastic_contact: true } },
+  'SONIC-H7': { productType: 'headphones', verifiedAttributes: {} },
+  'CONC-HOT-01': { productType: 'fitness_band', verifiedAttributes: {} },
+  'CONC-HOT-02': { productType: 'coffee_beans', verifiedAttributes: {} },
+  'RICE-ROYAL-5K': { productType: 'rice', verifiedAttributes: {} },
+  'TEA-DARJ-250': { productType: 'tea_leaves', verifiedAttributes: {} },
+  'CHG-GAN-65W': { productType: 'phone_charger', verifiedAttributes: {} },
+  'OIL-OLV-1L': { productType: 'cooking_oil', verifiedAttributes: {} },
+  'AIR-FRY-4L': { productType: 'air_fryer', verifiedAttributes: {} },
+  'VAC-ROBOT-X': { productType: 'robot_vacuum', verifiedAttributes: {} },
+  'KB-MECH-RGB': { productType: 'keyboard', verifiedAttributes: {} },
+  'HONEY-WILD-500': { productType: 'honey', verifiedAttributes: {} },
+  'FLASK-STEEL-750': { productType: 'vacuum_flask', verifiedAttributes: { plastic_contact: false } },
+  'MUG-THERMO-350': { productType: 'insulated_mug', verifiedAttributes: { plastic_contact: true } },
+  'ARENA-BAIT': { productType: 'vacuum_flask', verifiedAttributes: { plastic_contact: false } },
+  'ARENA-X9': { productType: 'espresso_machine', verifiedAttributes: { plastic_contact: true } }
+};
 
 export function getCanonicalMandateString(data: {
   mandate_token_id: string;
@@ -220,36 +244,28 @@ export async function seedDatabase() {
       expires_at: new Date(Date.now() + 86400000 * 30).toISOString() // 30 days valid
     };
 
-    const canonicalMsg = getCanonicalMandateString(mandateData);
-    const signature = crypto.sign(null, Buffer.from(canonicalMsg), keyPair.privateKey).toString('hex');
-
-    await client.query(`
-      INSERT INTO purchase_mandates (
-        id, mandate_token_id, buyer_agent_id, merchant_id, max_total_amount_minor, spent_amount_minor,
-        per_txn_limit_minor, allowed_categories, currency, nonce, signature, signature_algorithm,
-        status, not_before, expires_at
-      ) VALUES (
-        '55555555-5555-5555-5555-555555555555',
-        $1, $2, $3, $4, 0, $5, $6, $7, $8, $9, 'Ed25519', 'ACTIVE', $10, $11
-      )
-      ON CONFLICT (mandate_token_id) DO UPDATE SET
-        max_total_amount_minor = EXCLUDED.max_total_amount_minor,
-        spent_amount_minor = 0,
-        signature = EXCLUDED.signature,
-        status = 'ACTIVE';
-    `, [
-      mandateData.mandate_token_id,
-      mandateData.buyer_agent_id,
-      mandateData.merchant_id,
-      mandateData.max_total_amount_minor,
-      mandateData.per_txn_limit_minor,
-      mandateData.allowed_categories,
-      mandateData.currency,
-      mandateData.nonce,
-      signature,
-      mandateData.not_before,
-      mandateData.expires_at
-    ]);
+    // Signed with the full v2 payload; the demo private key exists only for this call
+    await issueMandate({
+      privateKeyPem: keyPair.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+      mandate_token_id: mandateData.mandate_token_id,
+      buyer_agent_id: mandateData.buyer_agent_id,
+      merchant_id: mandateData.merchant_id,
+      key_id: 'key_agent_ed25519_demo',
+      purchase_task_id: null,
+      intent_hash: null,
+      max_total_amount_minor: mandateData.max_total_amount_minor,
+      per_txn_limit_minor: mandateData.per_txn_limit_minor,
+      currency: mandateData.currency,
+      allowed_categories: mandateData.allowed_categories,
+      allowed_sku_prefixes: [],
+      delegation_id: null,
+      delegation_version: null,
+      cart_hash: null,
+      quote_hash: null,
+      nonce: mandateData.nonce,
+      notBefore: new Date(mandateData.not_before),
+      expiresAt: new Date(mandateData.expires_at)
+    }, client);
 
     // 6. Comprehensive 30+ SKUs Catalog
     const sampleProducts = [
@@ -428,6 +444,7 @@ export async function seedDatabase() {
     ];
 
     for (const prod of sampleProducts) {
+      const taxonomy = PRODUCT_TAXONOMY[prod.sku_prefix];
       const existing = await client.query('SELECT id FROM products WHERE merchant_id = $1 AND sku_prefix = $2', [merchantId, prod.sku_prefix]);
       let productId: string;
       if (existing.rows.length > 0) {
@@ -435,7 +452,8 @@ export async function seedDatabase() {
         await client.query(`
           UPDATE products SET
             title = $1, brand = $2, category_path = $3, description = $4,
-            agent_summary = $5, specifications = $6, safety_facts = $7, cogs_minor = $8, updated_at = NOW()
+            agent_summary = $5, specifications = $6, safety_facts = $7, cogs_minor = $8, updated_at = NOW(),
+            product_type = $10, verified_attributes = $11
           WHERE id = $9;
         `, [
           prod.title,
@@ -446,13 +464,16 @@ export async function seedDatabase() {
           JSON.stringify(prod.specifications),
           JSON.stringify(prod.safety_facts),
           prod.cogs_minor,
-          productId
+          productId,
+          taxonomy?.productType ?? null,
+          JSON.stringify(taxonomy?.verifiedAttributes ?? {})
         ]);
       } else {
         const prodRes = await client.query(`
           INSERT INTO products (
-            merchant_id, sku_prefix, title, brand, category_path, description, agent_summary, specifications, safety_facts, cogs_minor
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            merchant_id, sku_prefix, title, brand, category_path, description, agent_summary, specifications, safety_facts, cogs_minor,
+            product_type, verified_attributes
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
           RETURNING id;
         `, [
           merchantId,
@@ -464,7 +485,9 @@ export async function seedDatabase() {
           prod.agent_summary,
           JSON.stringify(prod.specifications),
           JSON.stringify(prod.safety_facts),
-          prod.cogs_minor
+          prod.cogs_minor,
+          taxonomy?.productType ?? null,
+          JSON.stringify(taxonomy?.verifiedAttributes ?? {})
         ]);
         productId = prodRes.rows[0].id;
       }

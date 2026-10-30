@@ -6,6 +6,8 @@ import { evaluatePolicy } from '../policy/engine.js';
 import { createRazorpayOrder } from '../payments/adapters/razorpay.js';
 import { createSimulatedPayment } from '../payments/adapters/mock.js';
 import { logAuditEvent } from '../audit/ledger.js';
+import { getPurchaseTask } from '../intent/tasks.js';
+import { authorizeLineForTask, loadAuthorizableProduct } from '../intent/authorize.js';
 import { generateMerkleProvenanceReceipt } from '../audit/provenance.js';
 import { commitReservationForCart } from '../inventory/reservation.js';
 import { reserveMandateBudget, commitMandateBudget, releaseMandateBudget } from '../policy/mandates.js';
@@ -42,8 +44,9 @@ export async function startCheckout(
   try {
     await client.query('BEGIN');
 
-    // 1. Fetch Cart
-    const cart = await getCart(cartId);
+    // 1. Fetch and lock the cart inside this transaction so its lines cannot change while the
+    //    quote is built and authorized
+    const cart = await getCart(cartId, { client, lock: true });
     if (!cart || cart.items.length === 0) {
       await client.query('ROLLBACK');
       return {
@@ -100,6 +103,52 @@ export async function startCheckout(
         priceMinor: item.unitPriceMinor,
         quantity: item.quantity
       });
+    }
+
+    // 2b. Intent revalidation. Authorization at add-to-cart time is not trusted here: every line is
+    //     re-checked against the purchase task with fresh product data.
+    const deny = async (code: string, message: string) => {
+      await client.query('ROLLBACK');
+      await logAuditEvent({
+        correlationId,
+        actor: `buyer_agent:${cart.buyerAgentId}`,
+        action: 'checkout.denied',
+        merchantId: cart.merchantId,
+        decision: 'DENIED',
+        humanReadable: `Checkout denied: ${message}`,
+        policyRuleId: 'RULE_INTENT_BOUND_AUTHORIZATION',
+        metadata: { cartId, mandateTokenId, reasonCode: code, grossAmountMinor: cart.grossAmountMinor, taskId: cart.purchaseTaskId }
+      });
+      return { ok: false, executionMode: 'DENIED' as const, errorCode: code, message };
+    };
+
+    if (cart.purchaseTaskId) {
+      const task = await getPurchaseTask(cart.purchaseTaskId, client);
+      if (!task) return deny('TASK_NOT_FOUND', 'The purchase task for this cart no longer exists.');
+      const cartQuantity = cart.items.reduce((n, i) => n + i.quantity, 0);
+      for (const item of cart.items) {
+        const product = await loadAuthorizableProduct(item.variantId, client);
+        if (!product) return deny('VARIANT_NOT_FOUND', `Variant ${item.variantId} no longer exists.`);
+        const verdict = authorizeLineForTask(task, cart.buyerAgentId, product, {
+          quantityForVariant: item.quantity,
+          cartQuantityAfter: cartQuantity,
+          cartGrossAfterMinor: cart.grossAmountMinor
+        });
+        if (!verdict.allowed) return deny(verdict.code, verdict.reason);
+      }
+    }
+
+    // Autonomous (mandate) checkout must be bound to the same purchase task as the mandate.
+    // A mandate alone proves a budget; only the task proves the items are what the human asked for.
+    if (mandateTokenId) {
+      const mRes = await client.query(`SELECT purchase_task_id FROM purchase_mandates WHERE mandate_token_id = $1;`, [mandateTokenId]);
+      const mandateTaskId: string | null = mRes.rows[0]?.purchase_task_id ?? null;
+      if (!cart.purchaseTaskId || !mandateTaskId) {
+        return deny('AUTONOMOUS_CHECKOUT_REQUIRES_TASK', 'Autonomous checkout needs a cart and mandate bound to a purchase task.');
+      }
+      if (mandateTaskId !== cart.purchaseTaskId) {
+        return deny('MANDATE_TASK_MISMATCH', 'The mandate was issued for a different purchase task than this cart.');
+      }
     }
 
     // 3. Compute Cryptographically Canonical RFC 8785 Cart & Quote Hashes (P0.2 & P0.3)

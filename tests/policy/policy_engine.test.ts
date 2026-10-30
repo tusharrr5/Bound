@@ -658,9 +658,11 @@ describe('Deterministic Policy Engine, Authorization & Risk Suite', () => {
       principalContext: principal
     });
 
+    // The seeded demo mandate is not bound to a purchase task, so autonomous checkout must refuse it:
+    // a mandate proves a budget, not that the items are what the human asked for. (The successful
+    // task-bound path is covered in tests/security/intent_authorization.test.ts.)
     expect(checkoutResp.intentProcessed).toBe('SUBMIT_CHECKOUT');
-    expect(checkoutResp.dialogue).toContain('Autonomous Checkout Confirmed');
-    expect(checkoutResp.provenanceProof).toBeDefined();
-    expect(checkoutResp.provenanceProof?.merkleRoot).toBeDefined();
+    expect(checkoutResp.dialogue).toContain('Checkout Rejected');
+    expect(checkoutResp.result.errorCode).toBe('AUTONOMOUS_CHECKOUT_REQUIRES_TASK');
   });
 });

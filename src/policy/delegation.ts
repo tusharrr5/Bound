@@ -2,7 +2,8 @@ import crypto from 'crypto';
 import pg from 'pg';
 import { pool } from '../db/pool.js';
 import { logAuditEvent } from '../audit/ledger.js';
-import { signMandate } from './mandates.js';
+import { issueMandate } from './mandate-signing.js';
+import { getPurchaseTask } from '../intent/tasks.js';
 
 export interface AgentDelegationInput {
   principalName: string;
@@ -39,6 +40,10 @@ export interface CreateMandateInput {
   quoteHash?: string;
   nonce?: string;
   validityHours?: number;
+  /** Bind the mandate to a purchase task; required for autonomous checkout. */
+  purchaseTaskId?: string;
+  /** Signing key to use; defaults to the agent's most recent active key. */
+  keyId?: string;
 }
 
 /**
@@ -274,44 +279,56 @@ export async function createPurchaseMandateFromDelegation(
     };
   }
 
-  const mandateTokenId = `mandate_tok_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-  const nonce = input.nonce || `nonce_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-  const validityHours = input.validityHours || 24 * 7;
-  const notBefore = new Date(Date.now() - 60000).toISOString();
-  const expiresAt = new Date(Date.now() + validityHours * 3600 * 1000).toISOString();
+  if (!privateKeyPem) {
+    return { ok: false, error: 'A signing key held by the human principal is required to issue a mandate.', errorCode: 'SIGNING_KEY_REQUIRED' };
+  }
 
-  // 3. Sign Mandate Payload
-  const signature = signMandate(privateKeyPem, {
+  // Optional task binding: the mandate signs the task's intent hash and may not exceed its budget
+  let intentHash: string | null = null;
+  if (input.purchaseTaskId) {
+    const task = await getPurchaseTask(input.purchaseTaskId, txClient);
+    if (!task || task.buyerAgentId !== input.buyerAgentId || task.merchantId !== input.merchantId || task.status !== 'ACTIVE') {
+      return { ok: false, error: 'Purchase task is missing, inactive, or belongs to another agent or merchant.', errorCode: 'TASK_BINDING_INVALID' };
+    }
+    if (input.maxTotalAmountMinor > task.maxBudgetMinor) {
+      return { ok: false, error: 'Mandate ceiling exceeds the purchase task budget.', errorCode: 'TASK_BUDGET_EXCEEDED' };
+    }
+    intentHash = task.intentHash;
+  }
+
+  const keyRes = await runner.query(`
+    SELECT key_id FROM mandate_key_bindings
+    WHERE buyer_agent_id = $1 AND status = 'ACTIVE' AND ($2::text IS NULL OR key_id = $2)
+    ORDER BY created_at DESC LIMIT 1;
+  `, [input.buyerAgentId, input.keyId ?? null]);
+  if (keyRes.rows.length === 0) {
+    return { ok: false, error: 'No active signing key is bound to this agent.', errorCode: 'SIGNING_KEY_NOT_BOUND' };
+  }
+
+  const mandateTokenId = `mandate_tok_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+  const validityHours = input.validityHours || 24 * 7;
+
+  // 3–4. Sign every enforced field (v2) and persist
+  const { signature, nonce } = await issueMandate({
+    privateKeyPem,
     mandate_token_id: mandateTokenId,
     buyer_agent_id: input.buyerAgentId,
     merchant_id: input.merchantId,
+    key_id: keyRes.rows[0].key_id,
+    purchase_task_id: input.purchaseTaskId ?? null,
+    intent_hash: intentHash,
     max_total_amount_minor: input.maxTotalAmountMinor,
-    nonce
-  });
-
-  // 4. Persist Mandate
-  await runner.query(`
-    INSERT INTO purchase_mandates (
-      mandate_token_id, delegation_id, delegation_version, buyer_agent_id, merchant_id, max_total_amount_minor,
-      spent_amount_minor, reserved_amount_minor, per_txn_limit_minor, allowed_categories,
-      cart_hash, quote_hash, currency, nonce, signature, signature_algorithm, status, not_before, expires_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, 0, 0, $7, $8, $9, $10, 'INR', $11, $12, 'Ed25519', 'ACTIVE', $13, $14);
-  `, [
-    mandateTokenId,
-    input.delegationId,
-    delegation.version || 1,
-    input.buyerAgentId,
-    input.merchantId,
-    input.maxTotalAmountMinor,
-    input.perTxnLimitMinor || input.maxTotalAmountMinor,
-    childCategories,
-    input.cartHash || null,
-    input.quoteHash || null,
-    nonce,
-    signature,
-    notBefore,
-    expiresAt
-  ]);
+    per_txn_limit_minor: input.perTxnLimitMinor || input.maxTotalAmountMinor,
+    currency: 'INR',
+    allowed_categories: childCategories,
+    allowed_sku_prefixes: [],
+    delegation_id: input.delegationId,
+    delegation_version: delegation.version || 1,
+    cart_hash: input.cartHash || null,
+    quote_hash: input.quoteHash || null,
+    nonce: input.nonce,
+    expiresAt: new Date(Date.now() + validityHours * 3600 * 1000)
+  }, txClient);
 
   await logAuditEvent({
     correlationId,

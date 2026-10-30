@@ -478,7 +478,7 @@ CREATE TABLE IF NOT EXISTS arena_runs (
     goal TEXT NOT NULL,
     listing_description TEXT NOT NULL,
     model TEXT NOT NULL,
-    outcome TEXT NOT NULL CHECK (outcome IN ('BLOCKED', 'FOOLED_NO_CHECKOUT', 'PURCHASED', 'NO_PURCHASE', 'BREACH')),
+    outcome TEXT NOT NULL,
     fooled BOOLEAN NOT NULL,
     attempted_amount_minor BIGINT,
     money_moved_minor BIGINT NOT NULL DEFAULT 0,
@@ -488,3 +488,34 @@ CREATE TABLE IF NOT EXISTS arena_runs (
     duration_ms INTEGER NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ─── PURCHASE TASKS (INTENT-BOUND AUTHORIZATION) ─────────────────────────────
+-- What the human actually asked for. Cart lines and autonomous checkouts must satisfy the task,
+-- not just the budget. Written only by the server; the model can never create or widen one.
+CREATE TABLE IF NOT EXISTS purchase_tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    principal_id TEXT NOT NULL,
+    buyer_agent_id UUID NOT NULL REFERENCES buyer_agents(id),
+    merchant_id UUID NOT NULL REFERENCES merchants(id),
+    original_request TEXT NOT NULL CHECK (length(original_request) BETWEEN 1 AND 1000),
+    normalized_intent TEXT,
+    allowed_product_types TEXT[] NOT NULL DEFAULT '{}',
+    excluded_product_types TEXT[] NOT NULL DEFAULT '{}',
+    required_attributes JSONB NOT NULL DEFAULT '{}',
+    allowed_variant_ids UUID[] NOT NULL DEFAULT '{}',
+    max_budget_minor BIGINT NOT NULL CHECK (max_budget_minor > 0),
+    max_total_quantity INTEGER NOT NULL CHECK (max_total_quantity BETWEEN 1 AND 1000),
+    max_quantity_per_item INTEGER NOT NULL CHECK (max_quantity_per_item BETWEEN 1 AND 1000),
+    currency TEXT NOT NULL DEFAULT 'INR' CHECK (currency = 'INR'),
+    status TEXT NOT NULL CHECK (status IN ('PENDING_CONFIRMATION', 'ACTIVE', 'COMPLETED', 'CANCELLED', 'EXPIRED')),
+    confirmation_source TEXT CHECK (confirmation_source IN ('HUMAN_CONFIRMED', 'RESOLVER_UNAMBIGUOUS')),
+    intent_hash TEXT NOT NULL,
+    authorization_version INTEGER NOT NULL DEFAULT 1 CHECK (authorization_version >= 1),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    CHECK (expires_at > created_at),
+    CHECK (max_quantity_per_item <= max_total_quantity),
+    -- An ACTIVE task must name at least one product type and say how it was confirmed
+    CHECK (status <> 'ACTIVE' OR (cardinality(allowed_product_types) > 0 AND confirmation_source IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_purchase_tasks_agent ON purchase_tasks (buyer_agent_id, status);

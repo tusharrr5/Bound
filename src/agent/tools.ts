@@ -116,11 +116,20 @@ export const buyerAgentTools = agentToolDefinitions.map(t => ({
   input_schema: t.input_schema
 }));
 
+/**
+ * Server-side context for a run. Never filled from model output: the model cannot choose or
+ * change the purchase task its cart is bound to.
+ */
+export interface ToolRunContext {
+  purchaseTaskId?: string;
+}
+
 export async function executeToolCall(
   toolName: string,
   args: any,
   correlationId: string,
-  principal?: PrincipalContext
+  principal?: PrincipalContext,
+  context: ToolRunContext = {}
 ) {
   const agentId = principal?.agentId || args.buyer_agent_id || '22222222-2222-2222-2222-222222222222';
   const merchantId = principal?.merchantId || args.merchant_id;
@@ -142,7 +151,7 @@ export async function executeToolCall(
       return getProductDetail(args.variant_id);
 
     case 'create_cart':
-      return createCart(agentId, correlationId, merchantId);
+      return createCart(agentId, correlationId, merchantId, { purchaseTaskId: context.purchaseTaskId });
 
     case 'add_to_cart':
       return addToCart(args.cart_id, args.variant_id, args.quantity, correlationId);

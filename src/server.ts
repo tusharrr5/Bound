@@ -34,7 +34,7 @@ import {
   executeFailureRecoveryPlaybook,
   executeFulfilmentCompensationPlaybook
 } from './demo/playbooks.js';
-import { runArena, runDirectCheck, getArenaStats, getBaitListing, updateBaitListing, listAttackPresets, ArenaBusyError } from './arena/service.js';
+import { runArena, runDirectCheck, getArenaStats, getBaitListing, updateBaitListing, listAttackPresets, ArenaBusyError, ArenaTaskError } from './arena/service.js';
 import { DEFAULT_ARENA_GOAL, ARENA_MANDATE_CEILING_MINOR, ARENA_ALLOWED_CATEGORIES, PAYLOAD_VARIANT_ID } from './arena/catalog.js';
 import { llmModel, LlmUnavailableError, warmModel } from './agent/llm.js';
 
@@ -517,6 +517,9 @@ fastify.post('/v1/arena/run', async (req, reply) => {
   } catch (err) {
     if (err instanceof ArenaBusyError) {
       return reply.status(409).send({ ok: false, error: 'ARENA_BUSY', message: err.message });
+    }
+    if (err instanceof ArenaTaskError) {
+      return reply.status(422).send({ ok: false, error: 'TASK_NEEDS_HUMAN_CONFIRMATION', message: err.message, candidates: err.candidates });
     }
     if (err instanceof LlmUnavailableError) {
       return reply.status(503).send({ ok: false, error: 'LLM_UNAVAILABLE', message: err.message });
