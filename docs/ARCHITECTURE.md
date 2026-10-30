@@ -38,8 +38,8 @@ test-only simulated rail. `audit.kms_worm_storage` reports `SIMULATED`.
 | `MOCK_SIMULATED_RAIL` | Checkout with a valid signed purchase mandate | Simulated capture ([src/payments/adapters/mock.ts](../src/payments/adapters/mock.ts)). No money moves. Allowed when `NODE_ENV !== 'production'` or `ENABLE_SIMULATED_PAYMENT_RAIL=true`. |
 | `RAZORPAY_STANDARD` | Checkout without a mandate | Creates a Razorpay Test Mode order ([src/payments/adapters/razorpay.ts](../src/payments/adapters/razorpay.ts)) and requires a human to pay. If the Razorpay call fails (e.g. no keys), it falls back to a locally generated `order_test_…` id with a console warning. |
 
-Razorpay offers no way for an agent to pay without a human, so autonomous capture is
-simulated by design.
+Our Razorpay Test Mode integration needs a human to approve each payment, so autonomous
+capture runs on a simulated, test-only rail.
 
 ## 4. Razorpay webhook verification
 

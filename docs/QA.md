@@ -8,7 +8,7 @@ The AI is real and runs locally: Gemma 4 (`gemma4:e4b`) through Ollama, with no 
 
 Simulated:
 
-- **The autonomous payment rail.** No money moves. Razorpay has no way for an agent to pay without a human, so autonomous capture is a test-only rail. The Razorpay path creates real Test Mode orders when keys are set, and a human authorises payment.
+- **The autonomous payment rail.** No money moves. Our Razorpay Test Mode integration needs a human to approve each payment, so autonomous capture runs on a test-only rail. The Razorpay path creates real Test Mode orders when keys are set, and a human authorises payment.
 - **The checkpoint "vault".** Signed audit checkpoints are kept in memory with a locally generated key. There is no AWS KMS and no S3 Object Lock.
 - **The human's signing key.** Each Arena run generates the key on the server; in a real product it would live on the person's phone.
 - **Passkey step-up.** The server-side verification is real; the authenticator is a software key.

@@ -28,7 +28,7 @@ at checkout.
 | Hash-chained audit ledger (RFC 8785 + SHA-256), transactional outbox | **Real** |
 | Razorpay Test Mode orders | **Real** when test keys are set; falls back to a local `order_test_…` id when they are not |
 | Webhook HMAC verification, dedup, secret rotation | **Real** code path; the demos feed it locally signed `TEST_INJECTION` webhooks, not Razorpay deliveries |
-| Autonomous payment rail | **Simulated.** No money moves. Razorpay has no agent-pays-without-a-human API, so autonomous capture is test-only by design |
+| Autonomous payment rail | **Simulated.** No money moves. Our Razorpay Test Mode integration needs a human to approve each payment, so autonomous capture runs on a test-only rail |
 | Audit checkpoint anchoring ("WORM vault") | **Simulated.** Signed with a locally generated Ed25519 key, stored in memory, resets on restart. No AWS KMS, no S3 Object Lock |
 | WebAuthn step-up | Server-side verification is real; the authenticator is a software key generated on the server |
 | Webhook secret handles (`kms://…`) | Resolved by an in-memory mock |
