@@ -109,7 +109,10 @@ export async function verifyPurchaseMandate(
       mkb.algorithm,
       mkb.status AS key_status
     FROM purchase_mandates pm
+    -- A mandate that names its signing key is verified against exactly that key, so an agent can
+    -- hold several active keys (e.g. concurrent Arena runs) without one run breaking another.
     JOIN mandate_key_bindings mkb ON mkb.buyer_agent_id = pm.buyer_agent_id
+      AND (pm.key_id IS NULL OR mkb.key_id = pm.key_id)
     LEFT JOIN agent_delegations ad ON ad.id = pm.delegation_id
     WHERE pm.mandate_token_id = $1;
   `, [mandateTokenId]);

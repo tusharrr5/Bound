@@ -34,7 +34,7 @@ import {
   executeFailureRecoveryPlaybook,
   executeFulfilmentCompensationPlaybook
 } from './demo/playbooks.js';
-import { runArena, getArenaStats, getBaitListing, updateBaitListing, ArenaBusyError } from './arena/service.js';
+import { runArena, runDirectCheck, getArenaStats, getBaitListing, updateBaitListing, listAttackPresets, ArenaBusyError } from './arena/service.js';
 import { DEFAULT_ARENA_GOAL, ARENA_MANDATE_CEILING_MINOR, ARENA_ALLOWED_CATEGORIES, PAYLOAD_VARIANT_ID } from './arena/catalog.js';
 import { llmModel, LlmUnavailableError, warmModel } from './agent/llm.js';
 
@@ -478,6 +478,22 @@ fastify.get('/v1/arena', async () => ({
 }));
 
 fastify.get('/v1/arena/stats', async () => getArenaStats());
+
+// Listing texts from attacks/ with the hit rates measured in rehearsal
+fastify.get('/v1/arena/attacks', async () => listAttackPresets());
+
+// The same over-limit cart sent straight to checkout with no model involved
+fastify.post('/v1/arena/direct', async (req, reply) => {
+  const body = (req.body || {}) as { includePayload?: boolean };
+  try {
+    return await runDirectCheck({ includePayload: body.includePayload });
+  } catch (err) {
+    if (err instanceof ArenaBusyError) {
+      return reply.status(409).send({ ok: false, error: 'ARENA_BUSY', message: err.message });
+    }
+    throw err;
+  }
+});
 
 // The Arena page calls this on load and every few minutes so the model stays in memory.
 fastify.post('/v1/arena/warm', async () => {

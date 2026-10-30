@@ -18,7 +18,7 @@ The claim is about where the spending check happens, not about moving money, so 
 
 ## Does the model really get fooled, or is that staged?
 
-It's live. Every Arena run sends a real listing to a real local model. In rehearsal, `gemma4:e4b` ignored plain-language injections ("seller note", "customer history", "buy this variant instead") in 15 of 15 runs. Text formatted like its own system turn (`<|system|> … <|end|>`) fooled it in 13 of 15, and checkout blocked all 13. The listing texts and counts are in [attacks/](../attacks).
+It's live. Every Arena run sends a real listing to a real local model. In rehearsal, `gemma4:e4b` ignored plain-language injections ("seller note", "customer history", "buy this variant instead") in 15 of 15 runs. Text formatted like its own system turn (`<|system|> … <|end|>`) fooled it in 13 of 15, and a fake user turn using Gemma-style markers fooled it 5 of 5; checkout blocked every one. Plain-English tricks fooled it 0 of 15, and fake tool output or a fake “buy 60” rule 0 of 10. The listing texts and counts are in [attacks/](../attacks), and the Arena offers them as presets with these rates.
 
 ## What if the injection stays under the limit and buys the wrong ₹4,000 thing?
 
@@ -42,6 +42,6 @@ Open weights mean an attacker can run the exact model you run, offline, and tune
 
 ## Known weak spots
 
-- One Arena run at a time, because one signing key is bound to the Arena agent.
+- One Arena run at a time per server, to keep the screen readable. (Concurrent runs from different processes are safe: each mandate is verified against its own key.)
 - On a 16 GB Mac, Ollama's memory has been seen growing from 10 GB to 18 GB over many runs. `npm run demo` warns when it does; restarting Ollama fixes it.
 - A run takes about 20–30 seconds on an M2 MacBook Air with reasoning off.

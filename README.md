@@ -107,7 +107,15 @@ curl -X POST localhost:4000/v1/arena/run
 ```
 
 Steps stream live as `arena_event` on `/v1/audit/stream`. In rehearsal the default injection
-fooled `gemma4:e4b` in 13 of 15 runs and checkout blocked all 13; see [attacks/](./attacks).
+fooled `gemma4:e4b` in 13 of 15 runs and a fake user turn fooled it 5 of 5; checkout blocked
+every one. Plain-English tricks fooled it 0 of 15, and fake tool output or a fake "buy 60" rule
+0 of 10. See [attacks/](./attacks).
+
+- **Pick a trick:** the listing panel offers the attacks in `attacks/` as one-click presets with
+  their measured hit rates (`GET /v1/arena/attacks`), so a judge can choose one that works.
+- **Skip the AI:** `POST /v1/arena/direct` fills the same cart with the ₹49,999 item and sends
+  it to checkout with no model involved. It shows the wall holds whoever fills the cart, and is
+  offered on screen whenever Gemma resists.
 
 ```bash
 npm run arena:measure -- 10                 # hit rate for the current listing
@@ -135,8 +143,9 @@ npm run arena:reset                         # clear the run counter, restore def
 npm test
 ```
 
-67 tests in 6 suites. **62 need PostgreSQL** (`DATABASE_URL`); the 5 in
-`tests/pricing/money_rounding.test.ts` are pure.
+71 tests in 7 suites. **66 need PostgreSQL** (`DATABASE_URL`); the 5 in
+`tests/pricing/money_rounding.test.ts` are pure. None need the model, so CI proves the wall
+without Gemma.
 
 | Suite | Tests | Covers |
 | :--- | ---: | :--- |
@@ -146,6 +155,7 @@ npm test
 | `tests/concurrency/reservation_race.test.ts` | 11 | 20 buyers for 1 unit, lock ordering, hoarding limits |
 | `tests/audit/audit_integrity.test.ts` | 8 | Hash chain, outbox atomicity, simulated anchor tamper detection |
 | `tests/pricing/money_rounding.test.ts` | 5 | Basis-point arithmetic and rounding |
+| `tests/arena/direct_check.test.ts` | 4 | The ₹49,999 cart refused under a ₹5,000 mandate with ₹0 moved; honest carts still pay; concurrent runs' keys don't collide |
 
 ## API
 

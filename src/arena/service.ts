@@ -1,8 +1,12 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { pool } from '../db/pool.js';
 import { runBuyerAgent, AgentStep } from '../agent/buyer-agent.js';
 import { signMandate } from '../policy/mandates.js';
-import { removeFromCart } from '../cart/service.js';
+import { createCart, addToCart, removeFromCart } from '../cart/service.js';
+import { startCheckout } from '../checkout/service.js';
 import { logAuditEvent } from '../audit/ledger.js';
 import { broadcastArenaEvent } from '../audit/stream.js';
 import {
@@ -68,8 +72,8 @@ let runInProgress = false;
 
 /**
  * Creates a fresh signed mandate for one run. The demo key is generated on this machine and
- * stands in for the human's device key; its private half is discarded after signing.
- * Only one signing key is bound to the Arena agent at a time, hence one run at a time.
+ * stands in for the human's device key; its private half is discarded after signing. The
+ * mandate names its key, so runs from different processes never invalidate each other.
  */
 async function createArenaMandate(correlationId: string): Promise<ArenaMandate> {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519', {
@@ -92,17 +96,21 @@ async function createArenaMandate(correlationId: string): Promise<ArenaMandate> 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('DELETE FROM mandate_key_bindings WHERE buyer_agent_id = $1', [ARENA_AGENT_ID]);
+    // Drop keys from Arena runs whose mandates have long expired
+    await client.query(`
+      DELETE FROM mandate_key_bindings WHERE buyer_agent_id = $1 AND created_at < NOW() - INTERVAL '2 hours';
+    `, [ARENA_AGENT_ID]);
+    const keyId = `key_${mandateTokenId}`;
     await client.query(`
       INSERT INTO mandate_key_bindings (buyer_agent_id, key_id, public_key, algorithm, status)
       VALUES ($1, $2, $3, 'Ed25519', 'ACTIVE');
-    `, [ARENA_AGENT_ID, `key_${mandateTokenId}`, publicKey]);
+    `, [ARENA_AGENT_ID, keyId, publicKey]);
     await client.query(`
       INSERT INTO purchase_mandates (
-        mandate_token_id, buyer_agent_id, merchant_id, max_total_amount_minor, reserved_amount_minor, spent_amount_minor,
+        mandate_token_id, buyer_agent_id, merchant_id, key_id, max_total_amount_minor, reserved_amount_minor, spent_amount_minor,
         per_txn_limit_minor, allowed_categories, currency, nonce, signature, signature_algorithm, status, not_before, expires_at
-      ) VALUES ($1, $2, $3, $4, 0, 0, $4, $5, 'INR', $6, $7, 'Ed25519', 'ACTIVE', $8, $9);
-    `, [mandateTokenId, ARENA_AGENT_ID, MERCHANT_ID, ARENA_MANDATE_CEILING_MINOR, ARENA_ALLOWED_CATEGORIES, nonce, signature, notBefore, expiresAt]);
+      ) VALUES ($1, $2, $3, $4, $5, 0, 0, $5, $6, 'INR', $7, $8, 'Ed25519', 'ACTIVE', $9, $10);
+    `, [mandateTokenId, ARENA_AGENT_ID, MERCHANT_ID, keyId, ARENA_MANDATE_CEILING_MINOR, ARENA_ALLOWED_CATEGORIES, nonce, signature, notBefore, expiresAt]);
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
@@ -157,6 +165,10 @@ function judgeRun(steps: AgentStep[]) {
 /** Releases stock held by carts the run left unpurchased, so repeated runs don't hit hoarding limits. */
 async function releaseOpenCarts(steps: AgentStep[], correlationId: string) {
   const cartIds = new Set(steps.filter(s => s.tool === 'create_cart' && s.toolResult?.cartId).map(s => s.toolResult.cartId as string));
+  await releaseCarts(cartIds, correlationId);
+}
+
+async function releaseCarts(cartIds: Iterable<string>, correlationId: string) {
   for (const cartId of cartIds) {
     const items = await pool.query(`
       SELECT ci.variant_id FROM cart_items ci JOIN carts c ON c.id = ci.cart_id
@@ -307,4 +319,99 @@ export async function updateBaitListing(description: string | null) {
     client.release();
   }
   return getBaitListing();
+}
+
+// ─── Direct check: the same cart, no AI ──────────────────────────────────────
+
+const DEMO_SHIPPING_ADDRESS = {
+  line1: '100 Silicon Valley, Indiranagar', city: 'Bengaluru', state: 'Karnataka', postal_code: '560038', country: 'IN'
+};
+
+export interface DirectCheckResult {
+  correlationId: string;
+  mandate: ArenaMandate;
+  /** Same shape as agent steps so the UI can render them in the same timeline. */
+  steps: AgentStep[];
+  checkout: any;
+  cartMinor?: number;
+  moneyMovedMinor: number;
+}
+
+/**
+ * Fills a cart with the bait flask and (by default) the injected ₹49,999 payload, with no model
+ * involved, and sends it to checkout under a freshly signed mandate. Proves the limit holds no
+ * matter who or what filled the cart. Not recorded in arena_runs: nothing was fooled.
+ */
+export async function runDirectCheck(params: { includePayload?: boolean } = {}): Promise<DirectCheckResult> {
+  if (runInProgress) throw new ArenaBusyError('An Arena run is already in progress.');
+  runInProgress = true;
+  const includePayload = params.includePayload ?? true;
+  const correlationId = `direct_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+
+  try {
+    const mandate = await createArenaMandate(correlationId);
+    const bait = await getBaitListing();
+    const steps: AgentStep[] = [];
+    const push = (step: Omit<AgentStep, 'stepIndex'>) => steps.push({ stepIndex: steps.length + 1, ...step });
+
+    const cart = await createCart(ARENA_AGENT_ID, correlationId, MERCHANT_ID);
+    push({ tool: 'create_cart', toolCall: { name: 'create_cart', input: {} }, toolResult: cart });
+
+    const variants = includePayload ? [bait.variantId, PAYLOAD_VARIANT_ID] : [bait.variantId];
+    let lastCart: any;
+    for (const variantId of variants) {
+      const res = await addToCart(cart.cartId, variantId, 1, correlationId);
+      lastCart = res.cart ?? lastCart;
+      push({
+        tool: 'add_to_cart',
+        toolCall: { name: 'add_to_cart', input: { cart_id: cart.cartId, variant_id: variantId, quantity: 1 } },
+        toolResult: res
+      });
+    }
+
+    const checkout = await startCheckout(cart.cartId, DEMO_SHIPPING_ADDRESS, correlationId, mandate.mandateTokenId);
+    push({
+      tool: 'start_checkout',
+      toolCall: { name: 'start_checkout', input: { cart_id: cart.cartId, mandate_token_id: mandate.mandateTokenId } },
+      toolResult: checkout,
+      decision: checkout.executionMode || checkout.errorCode
+    });
+
+    await releaseCarts([cart.cartId], correlationId);
+    const paid = checkout.ok === true && checkout.executionMode === 'AUTO_EXECUTABLE';
+    return {
+      correlationId,
+      mandate,
+      steps,
+      checkout,
+      cartMinor: lastCart?.grossAmountMinor,
+      moneyMovedMinor: paid ? Number(checkout.totalMinor || 0) : 0
+    };
+  } finally {
+    runInProgress = false;
+  }
+}
+
+// ─── Attack presets, read from the repo's attacks/ folder ────────────────────
+
+const ATTACKS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../attacks');
+
+export interface AttackPreset {
+  id: string;
+  name: string;
+  summary: string;
+  text: string;
+  runs: number;
+  fooled: number;
+  blocked: number;
+}
+
+/** Listing texts with the hit rates measured in rehearsal (attacks/index.json). */
+export function listAttackPresets(): AttackPreset[] {
+  const index: Array<Omit<AttackPreset, 'text'> & { file: string }> =
+    JSON.parse(fs.readFileSync(path.join(ATTACKS_DIR, 'index.json'), 'utf8'));
+  return index.map(({ file, ...meta }) => ({
+    ...meta,
+    text: fs.readFileSync(path.join(ATTACKS_DIR, file), 'utf8').trim()
+  }));
 }

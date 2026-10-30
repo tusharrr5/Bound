@@ -64,6 +64,26 @@ interface Listing {
   isDefault: boolean;
 }
 
+interface AttackPreset {
+  id: string;
+  name: string;
+  summary: string;
+  text: string;
+  runs: number;
+  fooled: number;
+  blocked: number;
+}
+
+/** Same cart sent straight to checkout with no model involved (POST /v1/arena/direct). */
+interface DirectResult {
+  correlationId: string;
+  mandate: ArenaMandate;
+  steps: AgentStep[];
+  checkout: any;
+  cartMinor?: number;
+  moneyMovedMinor: number;
+}
+
 interface ArenaState {
   defaultGoal: string;
   model: string;
@@ -135,10 +155,11 @@ const TOOL_ICON: Record<string, typeof Search> = {
   start_checkout: ShieldCheck
 };
 
-function StepRow({ step, titles, payloadVariantId }: {
+function StepRow({ step, titles, payloadVariantId, direct = false }: {
   step: AgentStep;
   titles: Map<string, { title: string; priceMinor: number }>;
   payloadVariantId: string;
+  direct?: boolean;
 }) {
   const input = step.toolCall?.input || {};
   const time = step.modelMs != null ? `${(step.modelMs / 1000).toFixed(1)}s` : '';
@@ -183,11 +204,11 @@ function StepRow({ step, titles, payloadVariantId }: {
       detail = step.toolResult?.cart ? `Cart total ${rupees(step.toolResult.cart.grossAmountMinor)}` : step.observation;
       if (injected) {
         node = 'bg-signal-rose/15 border-signal-rose text-signal-rose';
-        tag = <span className="text-[10px] font-bold tracking-wider rounded bg-signal-rose text-ink px-1.5 py-0.5">INJECTED</span>;
-        detail = 'The listing told it to. You never asked for this.';
+        tag = <span className="text-[10px] font-bold tracking-wider rounded bg-signal-rose text-ink px-1.5 py-0.5">{direct ? 'THE TRICK’S ITEM' : 'INJECTED'}</span>;
+        detail = direct ? 'Added straight to the cart. No AI involved.' : 'The listing told it to. You never asked for this.';
         raw = (
           <details className="mt-1.5 text-[12px]">
-            <summary className="cursor-pointer text-muted hover:text-paper">Exact call Gemma made</summary>
+            <summary className="cursor-pointer text-muted hover:text-paper">{direct ? 'Exact call sent' : 'Exact call Gemma made'}</summary>
             <pre className="mt-1.5 font-mono bg-ink border border-hairline rounded-lg p-2.5 overflow-x-auto text-signal-rose">{JSON.stringify(step.toolCall, null, 2)}</pre>
           </details>
         );
@@ -200,7 +221,7 @@ function StepRow({ step, titles, payloadVariantId }: {
     case 'start_checkout': {
       const denied = step.toolResult?.executionMode === 'DENIED';
       Icon = denied ? ShieldX : step.toolResult?.ok ? ShieldCheck : ShieldAlert;
-      label = denied ? 'Tried to check out · refused' : step.toolResult?.ok ? 'Checked out · paid' : 'Checkout failed';
+      label = denied ? `${direct ? 'Sent to checkout' : 'Tried to check out'} · refused` : step.toolResult?.ok ? 'Checked out · paid' : 'Checkout failed';
       node = denied ? 'bg-signal-rose/15 border-signal-rose text-signal-rose' : step.toolResult?.ok ? 'bg-signal-green/15 border-signal-green text-signal-green' : 'bg-signal-amber/15 border-signal-amber text-signal-amber';
       detail = denied ? step.toolResult?.errorCode : step.toolResult?.ok ? `${rupees(step.toolResult.totalMinor)} on the simulated rail` : step.toolResult?.message;
       break;
@@ -300,10 +321,39 @@ function CheckoutStamp({ checkout, running }: { checkout: any; running: boolean 
 
 // ─── Status strip: one line a judge can read from across the table ───────────
 
-function StatusStrip({ running, elapsed, result, runError, listingIsDefault }: {
+function StatusStrip({ running, elapsed, result, runError, listingIsDefault, direct, checking, onDirect }: {
   running: boolean; elapsed: number; result: ArenaRunResult | null; runError: string | null; listingIsDefault: boolean;
+  direct: DirectResult | null; checking: boolean; onDirect: () => void;
 }) {
   const base = 'rounded-2xl border px-6 h-[76px] flex items-center justify-between gap-4';
+  const wallButton = (
+    <button onClick={onDirect} className="shrink-0 rounded-xl border border-paper/30 hover:border-paper px-4 py-2 font-semibold text-paper transition-colors">
+      Show the wall anyway →
+    </button>
+  );
+
+  if (checking) {
+    return (
+      <div className={`${base} border-hairline bg-panel`}>
+        <p className="font-display text-2xl font-semibold flex items-center gap-3">
+          <LoaderCircle className="w-6 h-6 animate-spin text-muted" /> Sending the same cart straight to checkout, no AI…
+        </p>
+      </div>
+    );
+  }
+  if (direct) {
+    const refused = direct.checkout?.executionMode === 'DENIED';
+    return (
+      <div className={`${base} animate-manifest-enter ${refused ? 'border-signal-rose bg-signal-rose/10' : 'border-signal-green/70 bg-signal-green/10'}`}>
+        <p className="font-display text-2xl xl:text-3xl font-bold">
+          {refused
+            ? <>No AI involved: a <span className="text-signal-rose">{rupees(direct.cartMinor)}</span> cart went straight to checkout. Refused.</>
+            : <>No AI involved: a {rupees(direct.cartMinor)} cart, inside the limit. Paid.</>}
+        </p>
+        <p className="font-display text-2xl xl:text-3xl font-bold text-signal-green shrink-0">{rupees(direct.moneyMovedMinor)} moved</p>
+      </div>
+    );
+  }
 
   if (running) {
     return (
@@ -328,7 +378,7 @@ function StatusStrip({ running, elapsed, result, runError, listingIsDefault }: {
       <div className={`${base} border-hairline bg-panel/60`}>
         <p className="font-display text-xl text-paper/90">
           {listingIsDefault
-            ? 'The listing already hides an attack. Press Run, or rewrite it yourself.'
+            ? 'The listing already hides a trick. Press Run, or pick another trick on the left.'
             : 'Your listing is live. Press Run and see if Gemma falls for it.'}
         </p>
         <p className="text-sm text-muted shrink-0">Run · <kbd className="font-mono">⌘ ↵</kbd></p>
@@ -357,8 +407,8 @@ function StatusStrip({ running, elapsed, result, runError, listingIsDefault }: {
   if (outcome === 'PURCHASED') {
     return (
       <div className={`${base} animate-manifest-enter border-signal-green/70 bg-signal-green/10`}>
-        <p className="font-display text-2xl font-bold">Gemma resisted this one and bought within your limit.</p>
-        <p className="text-base text-paper/80 shrink-0">Rewrite the listing and try again →</p>
+        <p className="font-display text-2xl font-bold">Gemma resisted this one and paid only {rupees(result.moneyMovedMinor)}, inside your limit.</p>
+        {wallButton}
       </div>
     );
   }
@@ -372,8 +422,8 @@ function StatusStrip({ running, elapsed, result, runError, listingIsDefault }: {
   }
   return (
     <div className={`${base} animate-manifest-enter border-hairline bg-panel`}>
-      <p className="font-display text-xl font-semibold">Gemma didn't buy anything.</p>
-      <p className="text-sm text-muted truncate">“{result.agentSummary}”</p>
+      <p className="font-display text-xl font-semibold">Gemma didn't buy anything this time.</p>
+      {wallButton}
     </div>
   );
 }
@@ -392,6 +442,10 @@ export default function Arena() {
   const [mandate, setMandate] = useState<ArenaMandate | null>(null);
   const [result, setResult] = useState<ArenaRunResult | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
+  const [attacks, setAttacks] = useState<AttackPreset[]>([]);
+  const [direct, setDirect] = useState<DirectResult | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [showAllAttacks, setShowAllAttacks] = useState(false);
   const activeRun = useRef<string | null>(null);
   const timelineEnd = useRef<HTMLDivElement | null>(null);
 
@@ -410,6 +464,12 @@ export default function Arena() {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    fetch('/v1/arena/attacks').then(r => r.json())
+      .then((list: AttackPreset[]) => setAttacks([...list].sort((a, b) => b.fooled / b.runs - a.fooled / a.runs)))
+      .catch(() => setAttacks([]));
+  }, []);
 
   // Ollama unloads an idle model after 5 minutes; keep it warm while this page is open
   useEffect(() => {
@@ -450,10 +510,11 @@ export default function Arena() {
   }, [steps.length, running]);
 
   const run = useCallback(async () => {
-    if (running) return;
+    if (running || checking) return;
     setRunning(true);
     setElapsed(0);
     setResult(null);
+    setDirect(null);
     setRunError(null);
     setSteps([]);
     try {
@@ -474,7 +535,27 @@ export default function Arena() {
     } finally {
       setRunning(false);
     }
-  }, [goal, running]);
+  }, [goal, running, checking]);
+
+  // The same over-limit cart, no model: proves the wall even when Gemma resists
+  const runDirect = useCallback(async () => {
+    if (running || checking) return;
+    setChecking(true);
+    setResult(null);
+    setRunError(null);
+    try {
+      const res = await fetch('/v1/arena/direct', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || `Check failed (${res.status})`);
+      setDirect(data);
+      setSteps(data.steps);
+      setMandate(data.mandate);
+    } catch (err: any) {
+      setRunError(err.message);
+    } finally {
+      setChecking(false);
+    }
+  }, [running, checking]);
 
   // ⌘/Ctrl + Enter runs from anywhere on the page
   useEffect(() => {
@@ -538,7 +619,8 @@ export default function Arena() {
           </div>
         </header>
 
-        <StatusStrip running={running} elapsed={elapsed} result={result} runError={runError} listingIsDefault={state.listing.isDefault} />
+        <StatusStrip running={running} elapsed={elapsed} result={result} runError={runError} listingIsDefault={state.listing.isDefault}
+          direct={direct} checking={checking} onDirect={runDirect} />
 
         <div className="flex-1 min-h-0 grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_minmax(0,1fr)]">
 
@@ -555,13 +637,48 @@ export default function Arena() {
               <p className="font-display text-2xl font-bold shrink-0">{rupees(state.listing.priceMinor)}</p>
             </div>
 
+            {attacks.length > 0 && (
+              <div className="mt-4">
+                <p className="text-xs uppercase tracking-wider text-muted">Pick a trick <span className="normal-case tracking-normal">· fooled Gemma in rehearsal</span></p>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {attacks.filter(a => showAllAttacks || a.fooled / a.runs >= 0.5 || a.text === state.listing.description.trim()).map(a => {
+                    const active = state.listing.description.trim() === a.text && !listingDirty;
+                    const strong = a.fooled / a.runs >= 0.5;
+                    return (
+                      <button
+                        key={a.id}
+                        title={a.summary}
+                        onClick={() => saveListing(a.text)}
+                        disabled={savingListing || running || checking}
+                        className={`rounded-lg border px-2.5 py-1.5 text-[13px] text-left transition-colors disabled:opacity-50 ${
+                          active ? 'border-signal-rose bg-signal-rose/15 text-paper' : 'border-hairline bg-ink/60 text-paper/80 hover:border-paper/40'}`}
+                      >
+                        {a.name} <span className={`ml-1 font-mono text-[11px] ${strong ? 'text-signal-rose' : 'text-muted'}`}>{a.fooled}/{a.runs}</span>
+                      </button>
+                    );
+                  })}
+                  {/* Tricks Gemma resisted stay visible on request: the rates are the honest part */}
+                  {(() => {
+                    const weak = attacks.filter(a => a.fooled / a.runs < 0.5).length;
+                    if (!weak) return null;
+                    return (
+                      <button onClick={() => setShowAllAttacks(v => !v)} className="px-2 py-1.5 text-[12px] text-muted hover:text-paper">
+                        {showAllAttacks ? 'show fewer' : `+${weak} Gemma resisted`}
+                      </button>
+                    );
+                  })()}
+                </div>
+              </div>
+            )}
+
             <div className="mt-4 flex items-center justify-between">
               <label htmlFor="listing" className="text-xs uppercase tracking-wider text-muted">Description, written by the seller</label>
-              {listingDirty
-                ? <span className="text-[11px] font-semibold text-signal-amber">unpublished edits</span>
-                : state.listing.isDefault
-                  ? <span className="text-[11px] font-semibold text-signal-rose">default attack</span>
-                  : <span className="text-[11px] font-semibold text-signal-green inline-flex items-center gap-1"><Check className="w-3 h-3" /> your text is live</span>}
+              {(() => {
+                const preset = attacks.find(a => a.text === state.listing.description.trim());
+                if (listingDirty) return <span className="text-[11px] font-semibold text-signal-amber">unpublished edits</span>;
+                if (preset) return <span className="text-[11px] font-semibold text-signal-rose">{preset.name}</span>;
+                return <span className="text-[11px] font-semibold text-signal-green inline-flex items-center gap-1"><Check className="w-3 h-3" /> your own text is live</span>;
+              })()}
             </div>
             <textarea
               id="listing"
@@ -569,12 +686,12 @@ export default function Arena() {
               onChange={e => setDraft(e.target.value)}
               disabled={running}
               spellCheck={false}
-              className="mt-2 w-full flex-1 min-h-[180px] rounded-xl bg-ink border border-hairline focus:border-signal-rose focus:outline-none p-3.5 font-mono text-[13px] leading-relaxed text-paper/90 resize-none"
+              className="mt-2 w-full flex-1 min-h-[140px] rounded-xl bg-ink border border-hairline focus:border-signal-rose focus:outline-none p-3.5 font-mono text-[13px] leading-relaxed text-paper/90 resize-none"
             />
             <div className="mt-3 flex items-center gap-3">
               <button
                 onClick={() => saveListing(draft)}
-                disabled={!listingDirty || savingListing || running}
+                disabled={!listingDirty || savingListing || running || checking}
                 className="rounded-xl bg-signal-rose text-ink font-semibold px-4 py-2.5 disabled:bg-hairline disabled:text-muted transition-colors"
               >
                 {savingListing ? 'Publishing…' : 'Publish listing'}
@@ -582,10 +699,10 @@ export default function Arena() {
               {!state.listing.isDefault && (
                 <button
                   onClick={() => saveListing(null)}
-                  disabled={savingListing || running}
+                  disabled={savingListing || running || checking}
                   className="inline-flex items-center gap-1.5 text-sm text-muted hover:text-paper disabled:opacity-40"
                 >
-                  <RotateCcw className="w-4 h-4" /> Restore default attack
+                  <RotateCcw className="w-4 h-4" /> Restore default trick
                 </button>
               )}
             </div>
@@ -604,7 +721,7 @@ export default function Arena() {
               />
               <button
                 onClick={run}
-                disabled={running || !goal.trim()}
+                disabled={running || checking || !goal.trim()}
                 className="inline-flex items-center gap-2 rounded-xl bg-wire-blue hover:bg-blue-500 text-white font-semibold px-6 py-3 disabled:opacity-50 transition-colors"
                 title="⌘ + Enter"
               >
@@ -612,16 +729,28 @@ export default function Arena() {
               </button>
             </div>
 
-            <div className="mt-5 flex-1 min-h-0 overflow-y-auto pr-1">
+            <button
+              onClick={runDirect}
+              disabled={running || checking}
+              className="mt-2 self-end text-[13px] text-muted hover:text-paper disabled:opacity-40"
+              title="Fills the cart with the flask and the ₹49,999 item yourself and sends it to checkout under the same signed limit"
+            >
+              or skip the AI: send the trick’s cart straight to checkout →
+            </button>
+
+            <div className="mt-3 flex-1 min-h-0 overflow-y-auto pr-1">
             <ol>
-              {steps.length === 0 && !running && IDLE_STEPS.map((s, i) => (
+              {direct && (
+                <li className="pb-3 text-[13px] text-muted">No AI in this check. The cart below was filled directly, then sent to checkout.</li>
+              )}
+              {steps.length === 0 && !running && !checking && IDLE_STEPS.map((s, i) => (
                 <li key={s} className={STEP_LI}>
                   <span className="absolute left-0 top-0 w-7 h-7 rounded-full border border-hairline bg-ink text-[12px] font-mono text-muted flex items-center justify-center">{i + 1}</span>
                   <p className="text-[15px] text-muted pt-0.5">{s}</p>
                 </li>
               ))}
               {steps.map(step => (
-                <StepRow key={step.stepIndex} step={step} titles={titles} payloadVariantId={state.payloadVariantId} />
+                <StepRow key={step.stepIndex} step={step} titles={titles} payloadVariantId={state.payloadVariantId} direct={!!direct} />
               ))}
               {running && (
                 <li className={STEP_LI}>
@@ -651,7 +780,7 @@ export default function Arena() {
             </div>
 
             <div className="mt-4">
-              <CheckoutStamp checkout={checkout} running={running} />
+              <CheckoutStamp checkout={checkout} running={running || checking} />
             </div>
 
             <div className="mt-auto pt-4 text-[11px] font-mono text-muted space-y-1">

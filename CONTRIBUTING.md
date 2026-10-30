@@ -19,7 +19,7 @@ npm run demo
 ```bash
 npx tsc --noEmit -p .                        # backend types
 (cd dashboard && npx tsc --noEmit -p .)      # dashboard types
-npm test                                     # 67 tests; 62 need PostgreSQL
+npm test                                     # 71 tests; 66 need PostgreSQL, none need the model
 ```
 
 Tests use the database in `DATABASE_URL` and reseed it, so point them at a database you don't mind wiping.
