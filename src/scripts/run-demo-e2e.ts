@@ -13,6 +13,7 @@ import { pool } from '../db/pool.js';
 import { createAgentDelegation, createPurchaseMandateFromDelegation, getMandateDetails } from '../policy/delegation.js';
 import { issueHumanIdentityToken, verifyIdentityToken } from '../middleware/auth.js';
 import { getMerchantCapabilities } from '../agent/capabilities.js';
+import { createTaskBoundMandate } from '../arena/service.js';
 import { createSyntheticWebAuthnAssertion, verifyWebAuthnPasskeyCeremony } from '../policy/webauthn.js';
 import { processAutomaticCompensationRefund } from '../payments/refunds.js';
 import { runFullReconciliationCycle } from '../payments/reconciliation.js';
@@ -114,10 +115,13 @@ async function runLiveE2EDemo() {
   console.log('🤖 Initializing Autonomous Multi-Agent Commerce Session (Buyer Agent ↔ Seller Agent Façade)...\n');
 
   try {
-    const agentResult = await runBuyerAgent(
-      'Find a compact espresso coffee machine under ₹5,000, negotiate 5% discount, and purchase autonomously.',
-      { buyerAgentId, principalName: 'Aarav Sharma', mandateTokenId: 'mandate_tok_demo_2026' }
-    );
+    const goal = 'Find a compact espresso coffee machine under ₹5,000, negotiate 5% discount, and purchase autonomously.';
+    const correlationId = `corr_act1_${Date.now()}`;
+    const mandate = await createTaskBoundMandate({ correlationId, goal, buyerAgentId, principalId: 'Aarav Sharma', allowedCategories: [] });
+    const agentResult = await runBuyerAgent(goal, {
+      buyerAgentId, principalName: 'Aarav Sharma', correlationId, mandateTokenId: mandate.mandateTokenId,
+      spendingLimitMinor: mandate.ceilingMinor, purchaseTaskId: mandate.task.id
+    });
 
     console.log(`🧠 Model: ${agentResult.model} (local)\n`);
     for (const step of agentResult.steps) {

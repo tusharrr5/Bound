@@ -4,6 +4,8 @@ import { canonicalJson } from './ledger.js';
 
 export interface ExternalWormObject {
   checkpointId: string;
+  /** Merchant whose audit chain this checkpoint covers (v3). */
+  merchantId?: string;
   storageUri: string;
   kmsKeyArn: string;
   sequenceStart: number;
@@ -73,7 +75,15 @@ export const externalWormVault = new ExternalWormStorageVault();
 /**
  * Signs the audit root hash with the local dev key and writes it to the in-memory simulated WORM vault.
  */
+/** Signed checkpoint message. v3 binds the merchant so one merchant's checkpoint cannot vouch for another's chain. */
+export function checkpointPayload(o: { merchantId?: string; sequenceStart: number; sequenceEnd: number; rootHash: string; kmsKeyArn: string }): string {
+  return o.merchantId
+    ? `CHECKPOINT:v3:${o.merchantId}:${o.sequenceStart}:${o.sequenceEnd}:${o.rootHash}:${o.kmsKeyArn}:RFC8785:SHA-256`
+    : `CHECKPOINT:v2:${o.sequenceStart}:${o.sequenceEnd}:${o.rootHash}:${o.kmsKeyArn}:RFC8785:SHA-256`;
+}
+
 export async function anchorAuditRootToExternalWormStorage(params: {
+  merchantId?: string;
   sequenceStart: number;
   sequenceEnd: number;
   eventCount: number;
@@ -90,12 +100,13 @@ export async function anchorAuditRootToExternalWormStorage(params: {
   const storageUri = `${wormBucketUri}${checkpointId}.json`;
 
   const keyPair = externalWormVault.getKmsKeyPair();
-  const payloadToSign = `CHECKPOINT:v2:${params.sequenceStart}:${params.sequenceEnd}:${params.rootHash}:${kmsKeyArn}:RFC8785:SHA-256`;
+  const payloadToSign = checkpointPayload({ merchantId: params.merchantId, sequenceStart: params.sequenceStart, sequenceEnd: params.sequenceEnd, rootHash: params.rootHash, kmsKeyArn });
   const signature = crypto.sign(null, Buffer.from(payloadToSign), keyPair.privateKey).toString('hex');
   const signedAt = new Date().toISOString();
 
   const rawRecord = {
     checkpointId,
+    merchantId: params.merchantId,
     storageUri,
     kmsKeyArn,
     sequenceStart: params.sequenceStart,
@@ -162,16 +173,16 @@ export async function verifyExternalWormAnchors(): Promise<ExternalWormVerificat
   let dbMatchesExternal = true;
   let dbCompromiseDetected = false;
 
-  // Query latest DB state
-  const dbEventsRes = await pool.query('SELECT sequence_number, current_hash FROM audit_events ORDER BY sequence_number ASC;');
-  const dbEventsBySeq = new Map<number, string>();
+  // Query latest DB state, keyed by merchant and sequence (chains are per merchant)
+  const dbEventsRes = await pool.query('SELECT merchant_id, sequence_number, current_hash FROM audit_events;');
+  const dbEventsBySeq = new Map<string, string>();
   for (const row of dbEventsRes.rows) {
-    dbEventsBySeq.set(Number(row.sequence_number), row.current_hash);
+    dbEventsBySeq.set(`${row.merchant_id ?? ''}:${Number(row.sequence_number)}`, row.current_hash);
   }
 
   for (const obj of externalObjects) {
     // 1. Verify the Ed25519 signature of the anchored checkpoint
-    const payloadToSign = `CHECKPOINT:v2:${obj.sequenceStart}:${obj.sequenceEnd}:${obj.rootHash}:${obj.kmsKeyArn}:RFC8785:SHA-256`;
+    const payloadToSign = checkpointPayload(obj);
     const sigValid = crypto.verify(
       null,
       Buffer.from(payloadToSign),
@@ -184,7 +195,9 @@ export async function verifyExternalWormAnchors(): Promise<ExternalWormVerificat
     }
 
     // 2. Compare with PostgreSQL DB state at sequenceEnd
-    const dbHashAtSeq = dbEventsBySeq.get(obj.sequenceEnd);
+    const dbHashAtSeq = obj.merchantId
+      ? dbEventsBySeq.get(`${obj.merchantId}:${obj.sequenceEnd}`)
+      : [...dbEventsBySeq.entries()].find(([k]) => k.endsWith(`:${obj.sequenceEnd}`))?.[1];
     const hashesMatch = dbHashAtSeq === obj.rootHash;
 
     if (!hashesMatch) {

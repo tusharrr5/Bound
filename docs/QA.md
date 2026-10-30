@@ -18,15 +18,30 @@ The claim is about where the spending check happens, not about moving money, so 
 
 ## Does the model really get fooled, or is that staged?
 
-It's live. Every Arena run sends a real listing to a real local model. In rehearsal, `gemma4:e4b` ignored plain-language injections ("seller note", "customer history", "buy this variant instead") in 15 of 15 runs. Text formatted like its own system turn (`<|system|> … <|end|>`) fooled it in 13 of 15, and a fake user turn using Gemma-style markers fooled it 5 of 5; checkout blocked every one. Plain-English tricks fooled it 0 of 15, and fake tool output or a fake “buy 60” rule 0 of 10. The listing texts and counts are in [attacks/](../attacks), and the Arena offers them as presets with these rates.
+It's live. Every Arena run sends a real listing to a real local model. Before hardening, `gemma4:e4b` ignored plain-language injections ("seller note", "customer history", "buy this variant instead") in 15 of 15 runs. Text formatted like its own system turn (`<|system|> … <|end|>`) fooled it in 13 of 15, and a fake user turn using Gemma-style markers fooled it 5 of 5. After hardening, with seller text marked as seller content, those two fooled it 3 of 5 and 5 of 5. The cart refused the payload in every one, with ₹0 moved. The listing texts and counts are in [attacks/](../attacks).
 
 ## What if the injection stays under the limit and buys the wrong ₹4,000 thing?
 
-The wall doesn't stop that. It caps the damage at what the person signed: amount, categories, expiry. Narrow mandates keep that cap small, and anything that can't run autonomously goes back to the human. The claim isn't that the agent becomes wise; it's that the worst case is bounded by something the model can't talk its way past. An injected item that does get paid for is recorded as `BREACH`.
+That's refused too. The request becomes a purchase task: "something to keep my chai hot"
+authorizes a vacuum flask, an insulated mug or a mug warmer, with no plastic contact. A ₹1,000
+warmer plus an injected ₹4,000 espresso machine is exactly ₹5,000, inside the limit, and the
+cart still refuses the espresso machine (`PRODUCT_NOT_AUTHORIZED_FOR_TASK`). If it's forced into
+the cart some other way, checkout re-checks every line and refuses. The check uses the product's
+type from the merchant's catalog, not what the listing text claims. Asking for an espresso
+machine buys one normally. That exact scenario is a test
+(`tests/security/intent_authorization.test.ts`).
+
+What it still allows: a different product *of the type you asked for*, within budget, quantity
+and attributes. For example, a dearer flask than the one you'd have picked. That is bounded,
+not prevented. An injected item that does get paid for is recorded as `BREACH`.
 
 ## Why not harden the prompt, or add a guard model?
 
-The agent is told the budget; that's how it got fooled, because it believed the listing. A guard model is another model, and with open weights an attacker can practise against it as easily as against the agent. Prompt hardening is fine as an extra layer, but the last check has to compare the real cart total against something the model can't edit. Here, that's a signature.
+We did the cheap part: seller text reaches the model labelled as seller text. But that only
+makes injections less likely to work. A guard model is another model, and with open weights an
+attacker can practise against it as easily as against the agent. So the last checks have to be
+ones the model can't edit: the product type against the task, and the cart total against a
+signature.
 
 ## Isn't this just a card limit?
 
@@ -38,10 +53,21 @@ Open weights mean an attacker can run the exact model you run, offline, and tune
 
 ## What does the signature actually cover?
 
-`token:agent:merchant:ceiling:nonce`. Categories, the per-transaction limit and expiry are stored with the mandate and enforced at checkout, but aren't part of the signed message yet. That's an open issue, not a hidden one.
+Everything that's enforced: token, agent, merchant, ceiling, per-transaction limit, currency,
+categories, SKU prefixes, validity window, nonce, key id, and the purchase task with its intent
+hash. Canonical JSON, domain-separated, Ed25519. Edit any field in the database and verification
+fails. Older five-field mandates are refused by default.
+
+## Where does the human's key live?
+
+In the demo, on the server: each run generates a key, signs, and discards it. That stands in
+for a key on the person's phone. Client-side signing isn't built yet, and the API refuses to
+accept private keys in requests outside sandbox mode. It's the first blocker in
+[PRODUCTION_READINESS.md](./PRODUCTION_READINESS.md).
 
 ## Known weak spots
 
+- The intent taxonomy is a closed list. A request outside it, or matching two intents, waits for human confirmation, and there's no confirmation screen yet.
 - One Arena run at a time per server, to keep the screen readable. (Concurrent runs from different processes are safe: each mandate is verified against its own key.)
 - On a 16 GB Mac, Ollama's memory has been seen growing from 10 GB to 18 GB over many runs. `npm run demo` warns when it does; restarting Ollama fixes it.
 - A run takes about 20–30 seconds on an M2 MacBook Air with reasoning off.

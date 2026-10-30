@@ -503,8 +503,29 @@ export async function reconcileUncertainRefunds(txClient?: pg.PoolClient): Promi
         continue;
       }
 
-      // Check authoritative status with provider
-      const pspStatus = await fetchRazorpayRefund(refRow.razorpay_refund_id || refRow.id, refRow.razorpay_payment_id);
+      // Check authoritative status with provider. If the provider cannot answer, the refund stays
+      // uncertain and is retried later: an unanswered query is never treated as processed.
+      let pspStatus: { id: string; status: string; amount: number };
+      try {
+        pspStatus = await fetchRazorpayRefund(refRow.razorpay_refund_id || refRow.id, refRow.razorpay_payment_id);
+      } catch (err: any) {
+        await client.query(`
+          UPDATE refunds SET reconciliation_attempts = $1, reconciliation_error = $2,
+            next_reconciliation_attempt_at = NOW() + INTERVAL '60 seconds', updated_at = NOW()
+          WHERE id = $3;
+        `, [attempts, String(err?.message || err).slice(0, 300), refRow.id]);
+        await client.query('COMMIT');
+        incidents.push({
+          type: 'RECONCILIATION_FAILED',
+          paymentId: refRow.payment_pk,
+          orderId: refRow.order_id,
+          checkoutId: refRow.checkout_id,
+          resolvedStatus: refRow.status,
+          details: `Provider did not answer for refund ${refRow.id}; still ${refRow.status}, retrying later.`,
+          timestamp: new Date().toISOString()
+        });
+        continue;
+      }
 
       if (pspStatus.status === 'processed') {
         validateRefundTransition(refRow.status, 'PROCESSED');

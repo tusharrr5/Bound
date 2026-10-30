@@ -7,6 +7,7 @@ import { createAuditCheckpoint, verifyAuditLedger } from '../audit/ledger.js';
 import { verifyExternalWormAnchors } from '../audit/anchoring.js';
 import { broadcastFlowEvent, ManifestFlowEvent } from '../audit/stream.js';
 import { SellerAgent } from '../agent/seller-agent.js';
+import { createTaskBoundMandate } from '../arena/service.js';
 
 // Prefix for flow events whose evidence is hand-written narration rather than the output of a
 // real engine call. Kept visible so nobody mistakes a walkthrough for a live decision.
@@ -59,6 +60,11 @@ export async function executeAutonomousMandatePlaybook(): Promise<{ correlationI
   // Small micro-pause to let UI visualizer render real event sequence smoothly
   await new Promise(r => setTimeout(r, 200));
 
+  // A purchase task from the human's words, and a v2 mandate signed over it
+  const mandate = await createTaskBoundMandate({
+    correlationId, goal: 'Find a compact espresso coffee machine under ₹5,000 and buy it.', buyerAgentId, principalId: principalName, allowedCategories: []
+  });
+
   // Stage 2: Deterministic Policy Gate
   broadcastFlowEvent({
     correlationId,
@@ -73,15 +79,15 @@ export async function executeAutonomousMandatePlaybook(): Promise<{ correlationI
       paymentCapability: 'AUTO_EXECUTABLE',
       risk: 'ALLOW',
       executionPlan: 'AUTO_EXECUTABLE',
-      mandateToken: 'mandate_tok_demo_2026',
-      mandateCeilingMinor: 500000,
-      cartTotalMinor: 455905
+      mandateToken: mandate.mandateTokenId,
+      mandateCeilingMinor: mandate.ceilingMinor,
+      authorizedProductTypes: mandate.task.allowedProductTypes.join(', ')
     }
   });
 
   // Stage 3: Inventory Reservation
-  const cart = await createCart(buyerAgentId, correlationId);
-  const vRes = await pool.query(`SELECT id, sku, price_minor FROM product_variants WHERE sku = 'COFFEE-ESPR-BLK' LIMIT 1`);
+  const cart = await createCart(buyerAgentId, correlationId, undefined, { purchaseTaskId: mandate.task.id });
+  const vRes = await pool.query(`SELECT id, sku, price_minor FROM product_variants WHERE sku = 'BREW-42-BLK' LIMIT 1`);
   const variantId = vRes.rows[0].id;
 
   const startLock = Date.now();
@@ -114,24 +120,25 @@ export async function executeAutonomousMandatePlaybook(): Promise<{ correlationI
     cart.cartId,
     { line1: '100 Silicon Valley, Indiranagar', city: 'Bengaluru', postal_code: '560038', country: 'IN' },
     correlationId,
-    'mandate_tok_demo_2026'
+    mandate.mandateTokenId
   );
+  const paid = checkout.ok && checkout.executionMode === 'AUTO_EXECUTABLE';
 
   broadcastFlowEvent({
     correlationId,
     sequence: seq++,
     stage: 'PAYMENT',
-    eventType: 'PAYMENT_CAPTURED_SIMULATED',
-    status: 'SUCCESS',
+    eventType: paid ? 'PAYMENT_CAPTURED_SIMULATED' : 'PAYMENT_REFUSED',
+    status: paid ? 'SUCCESS' : 'FAILED',
     timestamp: new Date().toISOString(),
-    summary: 'Simulated payment captured under Ed25519 signed purchase mandate',
+    summary: paid ? 'Simulated payment captured under Ed25519 signed purchase mandate' : `Checkout refused: ${checkout.errorCode || checkout.message}`,
     evidence: {
       paymentRail: 'MOCK_SIMULATED_RAIL',
       environment: 'TEST_ONLY',
       authority: 'SIGNED MANDATE ✓',
       fundsMoved: false,
       amountMinor: checkout.totalMinor,
-      paymentSimulation: 'CAPTURED'
+      paymentSimulation: paid ? 'CAPTURED' : 'NOT_CAPTURED'
     }
   });
 

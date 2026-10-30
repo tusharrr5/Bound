@@ -56,18 +56,9 @@ export function getMerchantCheckpointKeyPair() {
  * Standard RFC 8785 / JCS JSON Canonicalization.
  * Produces deterministic byte representations regardless of key insertion order.
  */
-export function canonicalJson(obj: any): string {
-  if (obj === null || obj === undefined) return 'null';
-  if (typeof obj !== 'object') return JSON.stringify(obj);
-  if (Array.isArray(obj)) {
-    return '[' + obj.map(canonicalJson).join(',') + ']';
-  }
-  const sortedKeys = Object.keys(obj)
-    .filter(k => obj[k] !== undefined)
-    .sort();
-  const pairs = sortedKeys.map(k => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`);
-  return '{' + pairs.join(',') + '}';
-}
+// Moved to crypto/canonical.ts so intent, mandate and Merkle code can share it without import cycles
+export { canonicalJson } from '../crypto/canonical.js';
+import { canonicalJson } from '../crypto/canonical.js';
 
 /**
  * Computes cryptographically bound SHA-256 hash across previous hash and event fields.
@@ -139,11 +130,12 @@ export async function logAuditEvent(
         prevHash = headRes.rows[0].latest_hash;
       }
     } else {
-      // Fallback global serialization for system-level events without merchant scope
+      // System-level events without a merchant form their own chain
       const latestRes = await client.query(`
-        SELECT sequence_number, current_hash 
-        FROM audit_events 
-        ORDER BY sequence_number DESC 
+        SELECT sequence_number, current_hash
+        FROM audit_events
+        WHERE merchant_id IS NULL
+        ORDER BY sequence_number DESC
         LIMIT 1
         FOR UPDATE;
       `);
@@ -295,9 +287,10 @@ export async function getAuditTrail(correlationId?: string, limit: number = 50):
   }));
 }
 
-import { anchorAuditRootToExternalWormStorage, DEFAULT_KMS_KEY_ARN, DEFAULT_WORM_BUCKET_URI, externalWormVault } from './anchoring.js';
+import { anchorAuditRootToExternalWormStorage, checkpointPayload, DEFAULT_KMS_KEY_ARN, DEFAULT_WORM_BUCKET_URI, externalWormVault } from './anchoring.js';
 
 export async function createAuditCheckpoint(params?: {
+  merchantId?: string;
   keyId?: string;
   kmsKeyArn?: string;
   wormBucketUri?: string;
@@ -308,12 +301,18 @@ export async function createAuditCheckpoint(params?: {
   const wormBucketUri = params?.wormBucketUri || DEFAULT_WORM_BUCKET_URI;
   const retentionPolicy = params?.retentionPolicy || 'COMPLIANCE_MODE_7_YEARS';
 
+  // Checkpoints cover one merchant's chain (default: the primary demo merchant)
+  const merchantId: string | undefined = params?.merchantId
+    ?? (await pool.query(`SELECT id FROM merchants WHERE slug = 'apex-retail' LIMIT 1`)).rows[0]?.id;
+  if (!merchantId) return { error: 'No merchant to checkpoint' };
+
   const latestRes = await pool.query(`
-    SELECT sequence_number, current_hash 
-    FROM audit_events 
-    ORDER BY sequence_number DESC 
+    SELECT sequence_number, current_hash
+    FROM audit_events
+    WHERE merchant_id = $1
+    ORDER BY sequence_number DESC
     LIMIT 1;
-  `);
+  `, [merchantId]);
 
   if (latestRes.rows.length === 0) {
     return { error: 'No audit events to checkpoint' };
@@ -323,13 +322,14 @@ export async function createAuditCheckpoint(params?: {
   const rootHash = latestRes.rows[0].current_hash;
 
   const lastChkRes = await pool.query(`
-    SELECT sequence_end FROM audit_checkpoints ORDER BY sequence_end DESC LIMIT 1;
-  `);
+    SELECT sequence_end FROM audit_checkpoints WHERE merchant_id = $1 ORDER BY sequence_end DESC LIMIT 1;
+  `, [merchantId]);
   const seqStart = lastChkRes.rows.length > 0 ? Number(lastChkRes.rows[0].sequence_end) + 1 : 1;
   const eventCount = latestSeq - seqStart + 1;
 
   // 1. Sign root hash with the local dev key and anchor it in the simulated WORM vault
   const wormRecord = await anchorAuditRootToExternalWormStorage({
+    merchantId,
     sequenceStart: seqStart,
     sequenceEnd: latestSeq,
     eventCount,
@@ -344,8 +344,8 @@ export async function createAuditCheckpoint(params?: {
     INSERT INTO audit_checkpoints (
       sequence_start, sequence_end, event_count, root_hash, key_id, key_version,
       kms_key_arn, external_storage_uri, worm_retention_policy, object_lock_legal_hold,
-      external_object_sha256, signature, algorithm
-    ) VALUES ($1, $2, $3, $4, $5, 'v2', $6, $7, $8, $9, $10, $11, 'Ed25519')
+      external_object_sha256, signature, algorithm, merchant_id
+    ) VALUES ($1, $2, $3, $4, $5, 'v3', $6, $7, $8, $9, $10, $11, 'Ed25519', $12)
     RETURNING *;
   `, [
     seqStart,
@@ -358,7 +358,8 @@ export async function createAuditCheckpoint(params?: {
     retentionPolicy,
     true,
     wormRecord.objectSha256,
-    wormRecord.signature
+    wormRecord.signature,
+    merchantId
   ]);
 
   return {
@@ -374,8 +375,9 @@ export async function createAuditCheckpoint(params?: {
     wormRetentionPolicy: retentionPolicy,
     objectLockLegalHold: true,
     externalObjectSha256: wormRecord.objectSha256,
+    merchantId,
     keyId,
-    keyVersion: 'v2',
+    keyVersion: 'v3',
     signature: wormRecord.signature,
     algorithm: 'Ed25519',
     canonicalization: 'RFC8785',
@@ -395,27 +397,35 @@ export async function verifyAuditLedger(): Promise<{
   canonicalization: string;
   message: string;
 }> {
+  // Each merchant (and the merchant-less system chain) is its own hash chain from genesis
   const res = await pool.query(`
-    SELECT * FROM audit_events ORDER BY sequence_number ASC;
+    SELECT * FROM audit_events ORDER BY merchant_id NULLS FIRST, sequence_number ASC;
   `);
 
   let prevHash = GENESIS_HASH;
+  let currentChain: string | null | undefined = undefined;
+  const chainEnds = new Map<string, { seq: number; hash: string }>();
+  const fail = (i: number, seq: number, message: string) => ({
+    valid: false,
+    totalEventsChecked: i,
+    tamperedSequence: seq,
+    checkpointsValid: false,
+    checkpointCount: 0,
+    schemaVersion: AUDIT_SCHEMA_VERSION,
+    canonicalization: AUDIT_CANONICALIZATION,
+    message
+  });
 
   for (let i = 0; i < res.rows.length; i++) {
     const row = res.rows[i];
     const seq = Number(row.sequence_number);
+    if (row.merchant_id !== currentChain) {
+      currentChain = row.merchant_id;
+      prevHash = GENESIS_HASH;
+    }
 
     if (row.prev_event_hash !== prevHash) {
-      return {
-        valid: false,
-        totalEventsChecked: i,
-        tamperedSequence: seq,
-        checkpointsValid: false,
-        checkpointCount: 0,
-        schemaVersion: AUDIT_SCHEMA_VERSION,
-        canonicalization: AUDIT_CANONICALIZATION,
-        message: `Hash-chain broken at event #${seq}. Stored prev_hash does not match preceding event hash.`
-      };
+      return fail(i, seq, `Hash-chain broken at event #${seq} (merchant ${row.merchant_id ?? 'system'}). Stored prev_hash does not match preceding event hash.`);
     }
 
     const expectedHash = computeEventHash(
@@ -431,19 +441,20 @@ export async function verifyAuditLedger(): Promise<{
     );
 
     if (row.current_hash !== expectedHash) {
-      return {
-        valid: false,
-        totalEventsChecked: i,
-        tamperedSequence: seq,
-        checkpointsValid: false,
-        checkpointCount: 0,
-        schemaVersion: AUDIT_SCHEMA_VERSION,
-        canonicalization: AUDIT_CANONICALIZATION,
-        message: `Tampered payload detected at event #${seq}. Recomputed hash does not match stored hash.`
-      };
+      return fail(i, seq, `Tampered payload detected at event #${seq} (merchant ${row.merchant_id ?? 'system'}). Recomputed hash does not match stored hash.`);
     }
 
     prevHash = row.current_hash;
+    chainEnds.set(row.merchant_id ?? '', { seq, hash: row.current_hash });
+  }
+
+  // A ledger head that disagrees with its chain means events were removed from the end
+  const heads = await pool.query(`SELECT merchant_id, latest_sequence, latest_hash FROM audit_ledger_heads;`);
+  for (const h of heads.rows) {
+    const end = chainEnds.get(h.merchant_id);
+    if (Number(h.latest_sequence) > 0 && (!end || end.seq !== Number(h.latest_sequence) || end.hash !== h.latest_hash)) {
+      return fail(res.rows.length, Number(h.latest_sequence), `Ledger head for merchant ${h.merchant_id} does not match the end of its chain; events may have been removed.`);
+    }
   }
 
   const chkRes = await pool.query(`SELECT * FROM audit_checkpoints ORDER BY sequence_end ASC;`);
@@ -453,8 +464,14 @@ export async function verifyAuditLedger(): Promise<{
 
   for (const chk of chkRes.rows) {
     const keyToUse = chk.kms_key_arn || chk.key_id;
-    const payloadToSign = chk.key_version === 'v2'
-      ? `CHECKPOINT:v2:${chk.sequence_start}:${chk.sequence_end}:${chk.root_hash}:${keyToUse}:RFC8785:SHA-256`
+    const payloadToSign = chk.key_version === 'v3' || chk.key_version === 'v2'
+      ? checkpointPayload({
+          merchantId: chk.key_version === 'v3' ? chk.merchant_id : undefined,
+          sequenceStart: Number(chk.sequence_start),
+          sequenceEnd: Number(chk.sequence_end),
+          rootHash: chk.root_hash,
+          kmsKeyArn: keyToUse
+        })
       : `CHECKPOINT:v1:${chk.sequence_start}:${chk.sequence_end}:${chk.root_hash}:${chk.key_id}`;
 
     const verified = crypto.verify(

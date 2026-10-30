@@ -114,6 +114,32 @@ export async function runMigrations() {
       ALTER TABLE inventory_events ADD COLUMN IF NOT EXISTS reason TEXT;
       ALTER TABLE inventory_events ALTER COLUMN event_type DROP NOT NULL;
       ALTER TABLE inventory_events ALTER COLUMN quantity_change DROP NOT NULL;
+      -- Merchant-verified product metadata used for intent authorization (never seller-written)
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS product_type TEXT;
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS verified_attributes JSONB NOT NULL DEFAULT '{}';
+      CREATE INDEX IF NOT EXISTS idx_products_merchant_type ON products (merchant_id, product_type);
+
+      -- Carts and mandates bound to the purchase task they serve
+      ALTER TABLE carts ADD COLUMN IF NOT EXISTS purchase_task_id UUID REFERENCES purchase_tasks(id);
+      CREATE INDEX IF NOT EXISTS idx_carts_task ON carts (purchase_task_id);
+      ALTER TABLE purchase_mandates ADD COLUMN IF NOT EXISTS purchase_task_id UUID REFERENCES purchase_tasks(id);
+      -- Mandate signature scheme version (2 = full canonical payload) and the signed task intent hash
+      ALTER TABLE purchase_mandates ADD COLUMN IF NOT EXISTS signature_version INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE purchase_mandates ADD COLUMN IF NOT EXISTS intent_hash TEXT;
+
+      -- Arena outcomes now separate "the model resisted" from "the backend blocked it" (old values kept for history)
+      ALTER TABLE arena_runs DROP CONSTRAINT IF EXISTS arena_runs_outcome_check;
+      ALTER TABLE arena_runs ADD CONSTRAINT arena_runs_outcome_check CHECK (outcome IN (
+        'RESISTED', 'BLOCKED_AT_CART', 'BLOCKED_AT_CHECKOUT', 'REACHED_PAYMENT_LAYER', 'BREACH',
+        'BLOCKED', 'FOOLED_NO_CHECKOUT', 'PURCHASED', 'NO_PURCHASE'
+      ));
+
+      -- Audit chains are per merchant: sequence numbers are unique within a merchant, not globally
+      -- (a global UNIQUE made the first event of any second merchant fail to insert)
+      ALTER TABLE audit_events DROP CONSTRAINT IF EXISTS audit_events_sequence_number_key;
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_audit_events_merchant_seq ON audit_events (merchant_id, sequence_number) NULLS NOT DISTINCT;
+      ALTER TABLE audit_checkpoints ADD COLUMN IF NOT EXISTS merchant_id UUID REFERENCES merchants(id);
+
       -- Keep inventory history when a reservation row is removed
       ALTER TABLE inventory_events DROP CONSTRAINT IF EXISTS inventory_events_reservation_id_fkey;
       ALTER TABLE inventory_events ADD CONSTRAINT inventory_events_reservation_id_fkey

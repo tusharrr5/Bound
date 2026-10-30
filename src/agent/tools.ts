@@ -4,6 +4,7 @@ import { negotiatePrice } from '../negotiation/engine.js';
 import { startCheckout, getOrderStatus } from '../checkout/service.js';
 import { PrincipalContext } from '../middleware/auth.js';
 import { getMerchantCapabilities } from './capabilities.js';
+import { pool } from '../db/pool.js';
 
 export const agentToolDefinitions = [
   {
@@ -116,14 +117,40 @@ export const buyerAgentTools = agentToolDefinitions.map(t => ({
   input_schema: t.input_schema
 }));
 
+/**
+ * Server-side context for a run. Never filled from model output: the model cannot choose or
+ * change the purchase task its cart is bound to.
+ */
+export interface ToolRunContext {
+  purchaseTaskId?: string;
+  /** When set, checkout uses this mandate whatever token the model names. */
+  mandateTokenId?: string;
+}
+
+const denied = (code: string, message: string) => ({ ok: false, code, message });
+
+/** The cart, if it belongs to this agent and (for a task-bound run) to this run's task. */
+async function cartForRun(cartId: string, agentId: string, context: ToolRunContext) {
+  const cart = await getCart(cartId);
+  if (!cart || cart.buyerAgentId !== agentId) return { error: denied('CART_NOT_OWNED', 'No such cart for this agent.') };
+  if (context.purchaseTaskId && cart.purchaseTaskId !== context.purchaseTaskId) {
+    return { error: denied('CART_TASK_MISMATCH', 'This cart does not belong to the current purchase task.') };
+  }
+  return { cart };
+}
+
 export async function executeToolCall(
   toolName: string,
   args: any,
   correlationId: string,
-  principal?: PrincipalContext
+  principal?: PrincipalContext,
+  context: ToolRunContext = {}
 ) {
-  const agentId = principal?.agentId || args.buyer_agent_id || '22222222-2222-2222-2222-222222222222';
-  const merchantId = principal?.merchantId || args.merchant_id;
+  // Identity comes from the authenticated principal only, never from model-supplied arguments
+  const agentId = principal?.agentId;
+  const merchantId = principal?.merchantId;
+  const needsAgent = !['discover_capabilities', 'search_products', 'get_product_detail'].includes(toolName);
+  if (needsAgent && !agentId) return denied('UNAUTHENTICATED', 'This tool needs an authenticated buyer agent.');
 
   switch (toolName) {
     case 'discover_capabilities':
@@ -142,15 +169,23 @@ export async function executeToolCall(
       return getProductDetail(args.variant_id);
 
     case 'create_cart':
-      return createCart(agentId, correlationId, merchantId);
+      return createCart(agentId!, correlationId, merchantId, { purchaseTaskId: context.purchaseTaskId });
 
-    case 'add_to_cart':
+    case 'add_to_cart': {
+      const { error } = await cartForRun(args.cart_id, agentId!, context);
+      if (error) return error;
       return addToCart(args.cart_id, args.variant_id, args.quantity, correlationId);
+    }
 
     case 'request_negotiation':
-      return negotiatePrice(agentId, args.variant_id, args.proposed_price_minor, correlationId);
+      return negotiatePrice(agentId!, args.variant_id, args.proposed_price_minor, correlationId);
 
-    case 'start_checkout':
+    case 'start_checkout': {
+      const { error } = await cartForRun(args.cart_id, agentId!, context);
+      if (error) return error;
+      if (context.mandateTokenId && args.mandate_token_id && args.mandate_token_id !== context.mandateTokenId) {
+        return denied('MANDATE_NOT_PERMITTED', 'Only the mandate issued for this run can be used.');
+      }
       return startCheckout(
         args.cart_id,
         args.shipping_address || {
@@ -161,11 +196,15 @@ export async function executeToolCall(
           country: 'IN'
         },
         correlationId,
-        args.mandate_token_id
+        context.mandateTokenId ?? args.mandate_token_id
       );
+    }
 
-    case 'get_order_status':
+    case 'get_order_status': {
+      const owner = await pool.query('SELECT buyer_agent_id FROM orders WHERE id = $1', [args.order_id]);
+      if (owner.rows[0]?.buyer_agent_id !== agentId) return denied('ORDER_NOT_OWNED', 'No such order for this agent.');
       return getOrderStatus(args.order_id);
+    }
 
     default:
       throw new Error(`Unknown buyer agent tool: ${toolName}`);

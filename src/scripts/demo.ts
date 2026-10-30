@@ -23,6 +23,16 @@ const port = Number(process.env.PORT) || 4000;
 const databaseUrl = process.env.DATABASE_URL || 'postgresql://localhost:5432/manifest_db';
 const started = Date.now();
 
+// The Arena needs its demo routes and the simulated payment rail. These are switched on here,
+// explicitly, for this process only; nothing else turns them on, and config refuses them in
+// production. Sandbox auth stays off: the Arena pages use no authenticated routes.
+const DEMO_FLAGS = { BOUND_DEMO_ROUTES: 'true', BOUND_SIMULATED_PAYMENTS: 'true', BOUND_SANDBOX_AUTH: 'false' } as const;
+if (process.env.NODE_ENV === 'production') {
+  console.error('\n  ✗ npm run demo is a local demo and refuses to run with NODE_ENV=production.');
+  process.exit(1);
+}
+for (const [k, v] of Object.entries(DEMO_FLAGS)) process.env[k] ??= v;
+
 const ok = (label: string, detail: string, since: number) =>
   console.log(`  ✓ ${label.padEnd(10)} ${detail}  (${((Date.now() - since) / 1000).toFixed(1)}s)`);
 
@@ -133,6 +143,8 @@ async function loadModel(model: string, baseUrl: string) {
 
 async function main() {
   console.log('\nBound · Trick my shopper\n');
+  console.log(`  Demo mode: demo routes ${process.env.BOUND_DEMO_ROUTES}, simulated payments ${process.env.BOUND_SIMULATED_PAYMENTS}, sandbox auth ${process.env.BOUND_SANDBOX_AUTH}`);
+  console.log('             local only (127.0.0.1); no real money can move.\n');
   const { llmModel, llmBaseUrl } = await import('../agent/llm.js');
   const model = llmModel();
   const baseUrl = llmBaseUrl();

@@ -2,6 +2,11 @@ import crypto from 'crypto';
 import pg from 'pg';
 import { pool } from '../db/pool.js';
 import { getCanonicalMandateString } from '../db/seed.js';
+import { verifyMandateRowV2, MANDATE_SIGNATURE_VERSION } from './mandate-signing.js';
+import { getPurchaseTask, computeIntentHash } from '../intent/tasks.js';
+
+/** Legacy v1 mandates (5 signed fields) are refused unless explicitly allowed for old dev data. */
+const legacyMandatesAllowed = () => process.env.BOUND_ALLOW_LEGACY_MANDATES === 'true';
 
 export interface PurchaseMandateData {
   mandate_token_id: string;
@@ -52,12 +57,18 @@ export interface MandateVerificationResult {
     | 'PARENT_DELEGATION_EXPIRED'
     | 'PARENT_DELEGATION_INVALID'
     | 'MANDATE_EXCEEDS_PARENT_DELEGATION_CEILING'
-    | 'DELEGATION_CATEGORY_DISALLOWED';
+    | 'DELEGATION_CATEGORY_DISALLOWED'
+    | 'SIGNATURE_VERSION_UNSUPPORTED'
+    | 'CURRENCY_MISMATCH'
+    | 'TASK_NOT_FOUND'
+    | 'TASK_NOT_ACTIVE'
+    | 'TASK_INTEGRITY_FAILED';
   reason?: string;
 }
 
 /**
- * Safe signing interface: signs mandate payload with private key custody without exposing private key bytes.
+ * LEGACY v1 signer (5 fields). Kept only to produce fixtures for the downgrade test; new mandates
+ * are issued with issueMandate() in mandate-signing.ts.
  */
 export function signMandate(privateKeyPem: string, data: {
   mandate_token_id: string;
@@ -100,7 +111,7 @@ export async function verifyPurchaseMandate(
     SELECT 
       pm.*,
       ad.status AS delegation_status,
-      ad.version AS delegation_version,
+      ad.version AS delegation_current_version,
       ad.max_total_amount_minor AS delegation_max_total_minor,
       ad.expires_at AS delegation_expires_at,
       ad.allowed_categories AS delegation_allowed_categories,
@@ -217,8 +228,13 @@ export async function verifyPurchaseMandate(
     };
   }
 
-  // 6. Intent Binding: Check cart_hash and quote_hash if specified in mandate
-  if (row.cart_hash && cartHash && row.cart_hash !== cartHash) {
+  if (row.currency !== 'INR') {
+    return { valid: false, errorCode: 'CURRENCY_MISMATCH', reason: `Mandate currency ${row.currency} does not match the order currency INR.` };
+  }
+
+  // 6. Intent Binding: a mandate bound to a cart or quote fails closed when the checkout
+  //    cannot present the matching hash
+  if (row.cart_hash && row.cart_hash !== cartHash) {
     return {
       valid: false,
       errorCode: 'CART_HASH_MISMATCH',
@@ -226,7 +242,7 @@ export async function verifyPurchaseMandate(
     };
   }
 
-  if (row.quote_hash && quoteHash && row.quote_hash !== quoteHash) {
+  if (row.quote_hash && row.quote_hash !== quoteHash) {
     return {
       valid: false,
       errorCode: 'QUOTE_HASH_MISMATCH',
@@ -234,24 +250,27 @@ export async function verifyPurchaseMandate(
     };
   }
 
-  // 7. Verify Cryptographic Ed25519 Signature
-  const canonicalMsg = getCanonicalMandateString({
-    mandate_token_id: row.mandate_token_id,
-    buyer_agent_id: row.buyer_agent_id,
-    merchant_id: row.merchant_id,
-    max_total_amount_minor: Number(row.max_total_amount_minor),
-    nonce: row.nonce
-  });
-
-  const payloadBuffer = Buffer.from(canonicalMsg);
-  const signatureBuffer = Buffer.from(row.signature, 'hex');
-
-  const isVerified = crypto.verify(
-    null,
-    payloadBuffer,
-    row.public_key,
-    signatureBuffer
-  );
+  // 7. Verify the Ed25519 signature over every enforced field (v2), refusing downgrades
+  const version = Number(row.signature_version || 1);
+  let isVerified: boolean;
+  if (version === MANDATE_SIGNATURE_VERSION) {
+    isVerified = !!row.key_id && row.key_id === row.bound_key_id && verifyMandateRowV2(row, row.key_id, row.public_key);
+  } else if (version === 1 && legacyMandatesAllowed()) {
+    const canonicalMsg = getCanonicalMandateString({
+      mandate_token_id: row.mandate_token_id,
+      buyer_agent_id: row.buyer_agent_id,
+      merchant_id: row.merchant_id,
+      max_total_amount_minor: Number(row.max_total_amount_minor),
+      nonce: row.nonce
+    });
+    isVerified = crypto.verify(null, Buffer.from(canonicalMsg), row.public_key, Buffer.from(row.signature, 'hex'));
+  } else {
+    return {
+      valid: false,
+      errorCode: 'SIGNATURE_VERSION_UNSUPPORTED',
+      reason: `Mandate signature version ${version} is not accepted; only v${MANDATE_SIGNATURE_VERSION} (full payload) mandates are valid.`
+    };
+  }
 
   if (!isVerified) {
     return {
@@ -259,6 +278,18 @@ export async function verifyPurchaseMandate(
       errorCode: 'SIGNATURE_INVALID',
       reason: 'Cryptographic Ed25519 signature verification failed for purchase mandate.'
     };
+  }
+
+  // 7b. Task binding: the task row must still match the intent hash the human signed
+  if (row.purchase_task_id) {
+    const task = await getPurchaseTask(row.purchase_task_id, txClient);
+    if (!task) return { valid: false, errorCode: 'TASK_NOT_FOUND', reason: 'The purchase task this mandate is bound to no longer exists.' };
+    if (computeIntentHash(task) !== task.intentHash || task.intentHash !== row.intent_hash) {
+      return { valid: false, errorCode: 'TASK_INTEGRITY_FAILED', reason: 'Purchase task no longer matches the intent hash signed into the mandate.' };
+    }
+    if (task.status !== 'ACTIVE' || new Date() > new Date(task.expiresAt)) {
+      return { valid: false, errorCode: 'TASK_NOT_ACTIVE', reason: `Purchase task is ${task.status === 'ACTIVE' ? 'expired' : task.status}.` };
+    }
   }
 
   // 8. Dynamic Budget & Ceiling Invariant with Version Binding:
@@ -279,7 +310,7 @@ export async function verifyPurchaseMandate(
       valid: false,
       errorCode: isDelegationConstrained ? 'MANDATE_EXCEEDS_PARENT_DELEGATION_CEILING' : 'MANDATE_EXHAUSTED',
       reason: isDelegationConstrained
-        ? `Proposed order amount ₹${(proposedAmountMinor / 100).toFixed(2)} exceeds parent delegation's current active budget ceiling ₹${(effectiveMaxTotal / 100).toFixed(2)} (Parent Delegation Version: ${row.delegation_version || 1}).`
+        ? `Proposed order amount ₹${(proposedAmountMinor / 100).toFixed(2)} exceeds parent delegation's current active budget ceiling ₹${(effectiveMaxTotal / 100).toFixed(2)} (Parent Delegation Version: ${row.delegation_current_version || 1}).`
         : `Proposed order amount ₹${(proposedAmountMinor / 100).toFixed(2)} exceeds available mandate budget ₹${(remaining / 100).toFixed(2)} (Spent: ₹${(spent / 100).toFixed(2)}, Reserved: ₹${(reserved / 100).toFixed(2)}).`
     };
   }
