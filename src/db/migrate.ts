@@ -134,6 +134,12 @@ export async function runMigrations() {
         'BLOCKED', 'FOOLED_NO_CHECKOUT', 'PURCHASED', 'NO_PURCHASE'
       ));
 
+      -- Audit chains are per merchant: sequence numbers are unique within a merchant, not globally
+      -- (a global UNIQUE made the first event of any second merchant fail to insert)
+      ALTER TABLE audit_events DROP CONSTRAINT IF EXISTS audit_events_sequence_number_key;
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_audit_events_merchant_seq ON audit_events (merchant_id, sequence_number) NULLS NOT DISTINCT;
+      ALTER TABLE audit_checkpoints ADD COLUMN IF NOT EXISTS merchant_id UUID REFERENCES merchants(id);
+
       -- Keep inventory history when a reservation row is removed
       ALTER TABLE inventory_events DROP CONSTRAINT IF EXISTS inventory_events_reservation_id_fkey;
       ALTER TABLE inventory_events ADD CONSTRAINT inventory_events_reservation_id_fkey
