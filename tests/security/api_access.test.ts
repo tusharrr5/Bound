@@ -199,3 +199,11 @@ describe('Production configuration fails closed', () => {
     expect(() => loadConfig({ ...base, ...override } as any)).toThrow(ConfigError);
   });
 });
+
+describe('Static file serving', () => {
+  it.each(['/assets/..%2f..%2fpackage.json', '/../package.json', '/%2e%2e/package.json', '/..%5c..%5cpackage.json'])(
+    'does not serve files outside the dashboard build: %s', async url => {
+      const res = await fastify.inject({ method: 'GET', url });
+      expect(res.body).not.toContain('"dependencies"');
+    });
+});
