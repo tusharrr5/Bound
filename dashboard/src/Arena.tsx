@@ -473,6 +473,14 @@ function StatusStrip({ running, elapsed, result, runError, listingIsDefault, dir
       </div>
     );
   }
+  if (result.blockedReasonCode) {
+    return (
+      <div className={`${base} animate-manifest-enter border-signal-amber/60 bg-signal-amber/10`}>
+        <p className="font-display text-xl font-semibold">Gemma wasn't fooled, but checkout refused the purchase: {result.blockedReason || result.blockedReasonCode}</p>
+        <p className="font-display text-2xl font-bold text-signal-green shrink-0">₹0 moved</p>
+      </div>
+    );
+  }
   return (
     <div className={`${base} animate-manifest-enter border-hairline bg-panel`}>
       <p className="font-display text-xl font-semibold">Gemma didn't buy anything this time.</p>
